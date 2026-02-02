@@ -1,4 +1,4 @@
-# [NeurIPS 2025] With Limited Data for Multimodal Alignment, Let the STRUCTURE Guide You 
+# [NeurIPS 2025] With Limited Data for Multimodal Alignment, Let the STRUCTURE Guide You
 
 [![Paper](https://img.shields.io/badge/arXiv-2506.16895-b31b1b.svg)](https://arxiv.org/abs/2506.16895)
 [![OpenReview](https://img.shields.io/badge/OpenReview-IkvQqD7hk3-8c1b13.svg)](https://openreview.net/forum?id=IkvQqD7hk3)
