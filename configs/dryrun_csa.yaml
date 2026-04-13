@@ -1,0 +1,44 @@
+defaults: !include default.yaml
+
+overrides:
+    features:
+        dataset: "coco"
+        num_workers: 2
+        batch_size: 32
+
+    alignment:
+        llm_model_name: "sentence-transformers/all-MiniLM-L6-v2"
+        lvm_model_name: "vit_small_patch14_dinov2.lvd142m"
+
+    layer_selection:
+        type: "random"
+        n_samples: 500
+        metric: "mutual_knn"
+        metric_kwargs:
+            topk: "rice"
+            normalize: true
+        n_score_bins: 5
+        best_only: true
+        last_only: false
+        n_last_layers: null
+
+    training:
+        cca: true
+        cca_kwargs:
+            sim_dim: 64
+            equal_weights: false
+            use_reg: false
+        drop_duplicates: true
+        n_dup_samples: 1
+        wandb_watch: false
+
+    evaluation:
+        batch_size: 64
+        num_workers: 2
+        num_classes_per_batch: 2
+        use_extended_prompts: true
+        plot_embedding_space: false
+        log_structural_preservation: false
+        zero_shot_datasets:
+            - "cifar10"
+        retrieval_datasets: []

@@ -1,0 +1,16 @@
+services:
+  structure:
+    build:
+      context: .
+      dockerfile: Dockerfile.structure
+    runtime: nvidia
+    volumes:
+      - ../:/workspace/STRUCTURE          # mount STRUCTURE code repo
+      - /path/to/data:/workspace/data     # adjust on Server B
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - PYTHONPATH=/workspace/STRUCTURE
+    working_dir: /workspace/STRUCTURE
+    shm_size: '16gb'
+    stdin_open: true
+    tty: true
