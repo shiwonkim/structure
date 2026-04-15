@@ -149,6 +149,150 @@ BA is in the same ballpark as Linear/MLP/ResLowRankHead on the dry-run.
 
 ## Change History
 
+### 2026-04-15 — Zero-shot segmentation evaluation (unified 4-method × 2-strategy framework)
+
+**Goal.** Add an open-vocabulary semantic-segmentation eval path so BA's
+CAP-pooling advantage on dense prediction can be quantified against FreezeAlign
+and a no-alignment baseline. The FreezeAlign paper reports 31.37 mIoU on
+PASCAL VOC 2012 but their reference script
+(`freeze-align/train/zero_shot_segmentation.py`) has several methodological
+issues we wanted to correct — most importantly, it averages per-image IoU
+instead of accumulating a confusion matrix, and it uses a min-max threshold
+instead of argmax.
+
+**Design.** A single shared evaluation loop consumes two method-specific
+primitives:
+
+```python
+method.get_patch_features(layer_feats, device) -> (P, D_m)
+method.get_text_features(classnames, templates, ...) -> (C, D_m)
+```
+
+Everything downstream — L2 normalize, cosine similarity, grid reshape,
+bilinear upscale, argmax, confusion-matrix accumulation, mean IoU —
+is shared across methods. Each method only defines how to produce per-patch
+and per-class descriptors in its own aligned space.
+
+**Four localization methods:**
+
+| Method | Image side | Text side | When to use |
+|---|---|---|---|
+| `direct_cosine` | raw encoder patches `(P, D_enc)` | raw LM embeddings `(C, D_enc)` | baseline, no checkpoint needed |
+| `freezealign` | `alignment_image.local_vision_proj(z)[:, 1:, :]` → `(P, E)` | `alignment_text(tokens, mask=…)` → `(C, E)` | FreezeAlign checkpoints |
+| `anchor_codebook` | `F.normalize(patches) @ F.normalize(anchors_img).T` → `(P, K)` | per-class CAP profile via `alignment_text(tokens, mask=…)` → `(C, K)` | BA-token checkpoints; codebook-level matching |
+| `attention_map` | `softmax(patches @ anchors_img.T / τ, dim=0)` → `(P, K)` | per-class CAP profile → `(C, K)` | BA-token checkpoints; "anchor attention where × class activates anchor" |
+
+The `attention_map` method is BA-specific and novel: the trained pool
+temperature `τ` is reused, and the softmax is over the patch axis so each
+column is a per-anchor attention distribution over the patch grid. The
+cosine between that and the per-class CAP profile answers "does the patch
+belong to a class whose profile activates the anchors that look here?"
+
+**Two text strategies** (applied uniformly to all four methods):
+
+| Strategy | Templates |
+|---|---|
+| `raw` | single no-op format `"{}"` (class name as-is) — matches FreezeAlign's reference behavior |
+| `ensemble` | 80 OpenAI ImageNet prompt templates (`DATASETS_TO_TEMPLATES["imagenet"]`), averaged per class |
+
+Template averaging is handled by the existing
+`src/evaluation/zero_shot_classifier.py::build_zero_shot_classifier`, which
+already knows how to:
+1. Tokenize `C × T` (classnames × templates) prompts at once
+2. Forward through the LM and select the right layer
+3. Pass each prompt through the alignment layer (with attention mask for
+   token-level heads)
+4. Reshape to `(C, T, D)`, L2-normalize each template, mean, re-normalize
+
+So the ensemble strategy gets per-template CAP attention patterns for BA,
+not a single mean embedding — each template independently produces its own
+anchor profile and they're averaged only in the final K-dim (or embed-dim)
+aligned space.
+
+**Improvements over the FreezeAlign reference script.**
+
+| Issue in reference | Fix |
+|---|---|
+| Per-image IoU averaged across val set | Confusion-matrix accumulation, standard mIoU = mean over classes of `TP / (TP + FP + FN)` |
+| Hard-coded `18, 18` patch grid | `h = int(round(sqrt(P)))` from actual token count |
+| `cv2.resize` linear for GT mask | GT kept at native resolution; similarity map is upscaled to GT size with `F.interpolate(mode='bilinear', align_corners=False)`. No lossy resize on targets. |
+| Min-max normalize + fixed 0.4 threshold per class | `argmax` across classes per pixel — standard semantic segmentation |
+| `target[target==255]=0` folds ignore into background | Ignore index (255) excluded from confusion matrix on both GT and pred |
+| Class names tokenized as-is (`diningtable`, `tvmonitor`) | Rewritten to `"dining table"`, `"tv monitor"`, `"potted plant"` in a `VOC2012_CLASS_PROMPTS` dict so subword tokenizers handle them sanely |
+| No prompt ensembling | Optional 80-template OpenAI set via `--text-strategies raw,ensemble` |
+| Classes that never appear in GT and are never predicted count as 0 IoU | `denom > 0` mask excludes them from the mean (standard practice; avoids penalizing rare classes) |
+
+**Mean IoU reporting.** `compute_iou_from_confusion` returns both
+`miou_all` (all 21 classes) and `miou_fg` (20 foreground classes only,
+excluding background at index 0). The foreground mIoU is the number that
+open-vocab seg papers typically report on VOC and is comparable to
+FreezeAlign's published 31.37.
+
+**Checkpoint dispatch.**
+
+```
+auto_filter_methods(requested, alignment_image, alignment_text, cfg)
+```
+
+drops methods that don't fit the loaded checkpoint's alignment class:
+
+- No checkpoint → only `direct_cosine` survives.
+- `BridgeAnchor*` → keeps BA methods + `direct_cosine`, drops `freezealign`.
+- `FreezeAlign*` → keeps `freezealign` + `direct_cosine`, drops BA methods.
+
+This lets one shared launcher call four methods regardless of which
+method's checkpoint is provided; incompatible entries are skipped with a
+warning instead of failing the run.
+
+**Usage.**
+
+```bash
+PYTHONPATH=. python src/evaluation/zero_shot_segmentation.py \
+    --config configs/ba/vits_minilm/token_k256.yaml \
+    --checkpoint results/alignment-.../checkpoint-epoch400.pth \
+    --layer-img 11 --layer-txt 6 \
+    --dataset voc2012 --data-root data/pascal_voc --download \
+    --methods anchor_codebook,attention_map,direct_cosine \
+    --text-strategies raw,ensemble \
+    --gpu 0
+```
+
+Or via the launcher:
+
+```bash
+bash scripts/eval_segmentation.sh \
+    configs/ba/vits_minilm/token_k256.yaml \
+    results/alignment-.../checkpoint-epoch400.pth \
+    0 11 6
+```
+
+**Verification.** Shape-checked with dummy tensors on CPU (no real
+encoder/dataset). For T=257, D=384, K=128, E=512, C=21:
+
+| Method | patch output | note |
+|---|---|---|
+| `anchor_codebook` | `(256, 128)` | ✓ |
+| `attention_map` | `(256, 128)` | ✓, per-anchor column sums = 1.0 (softmax over P) |
+| `freezealign` | `(256, 512)` | ✓ |
+| `direct_cosine` | `(256, 384)` | ✓ |
+
+Patch grid derivation: `P=256` → `h=w=16`, matches ViT-S/14 at img_size=224.
+Confusion matrix accumulation correctly excludes `ignore_index=255`
+(confusion total = valid-pixel count). Dispatch filter correctly drops
+`freezealign` under a BA checkpoint and `anchor_codebook`/`attention_map`
+under an FA checkpoint.
+
+**End-to-end run deferred** until Batch 2 completes and the first BA-token
+checkpoint is on disk. Data will auto-download on first run via
+`torchvision.datasets.VOCSegmentation(download=True)` (~2 GB).
+
+**Files touched.**
+
+- `src/evaluation/zero_shot_segmentation.py` (new, 500 lines)
+- `scripts/eval_segmentation.sh` (new launcher)
+
+---
+
 ### 2026-04-15 — CSA `sim_dim` PCA-rank cap — ViT-S configs 384 → 256
 
 **Symptom.** Baselines script crashed on run 5/6 (`csa_d384`) during `CSATrainer.fit` →
