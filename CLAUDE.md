@@ -197,7 +197,7 @@ PYTHONPATH=. python rerun_eval.py \
 
 - **COCO 2014** at `data/COCO/` — real 2014 split (82,783 train / 40,504 val), real 2014 JSON annotations. Downloaded fresh on Apr 14 after discovering the old `data/COCO/` was 2017-masquerading-as-2014 via symlinks. Old setup archived in `archive/2026-04-14_coco2017_vits/`.
 - **Flickr30k** at `data/flickr30k/` — cleaned single-directory layout after the two-level symlink chain was flattened Apr 14. Karpathy split files (`train.txt`/`val.txt`/`test.txt`) + pipe-delimited `results.csv` + `images/` (29,783 / 1K / 1K).
-- **ImageNet** symlinked from `/home/data/imagenet/` with `LOC_synset_mapping.txt`.
+- **ImageNet**: only `val` (~6 GB) + `LOC_synset_mapping.txt` are needed for zero-shot eval. `train` (~130 GB) is **not required** — `src/dataset_preparation/data_utils.py::get_datasets("imagenet", ...)` handles its absence gracefully: if `data/imagenet/train/` is missing or empty, the train `ImageFolder` is set to `None` and only the val split is returned. On Server B, provision val only.
 - **Auto-downloaded zero-shot datasets** (via torchvision): DTD, Flowers102, GTSRB, Country211, STL10, CIFAR10/100, MNIST, SUN397, Pets, Cars, Aircraft, Birdsnap, Food101, Caltech101, EuroSAT, Resisc45, UCF101, Kinetics700, PCam, HatefulMemes, SST, KITTI, FER2013, Clevr — not all tested; the 4-dataset subset in most configs (`cifar10/stl10/cifar100/mnist`) is the fast eval loop.
 
 ## Archive

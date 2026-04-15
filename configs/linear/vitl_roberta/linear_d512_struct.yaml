@@ -38,4 +38,5 @@ overrides:
             - "cifar100"
             - "mnist"
         retrieval_datasets:
+            - "flickr30"
             - "coco"

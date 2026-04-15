@@ -551,11 +551,20 @@ def get_datasets(dataset, transform, root_dir: Union[str, Path] = "./data", **kw
 
     elif dataset == "imagenet":
         """
-        Manually download from https://www.image-net.org/ and put to ./data/datasets/imagenet
+        Manually download from https://www.image-net.org/ and put under
+        ``<data_path>/imagenet/{train,val}`` with ``LOC_synset_mapping.txt``
+        alongside. ``train`` is optional: zero-shot evaluation only needs the
+        val split (~6 GB) and the synset mapping, so on deployments where the
+        full train split (~130 GB) isn't provisioned we skip the train
+        ImageFolder construction instead of failing.
         """
-        train_dataset = dsets.ImageFolder(
-            root=os.path.join(data_path, "imagenet/train"), transform=transform
-        )
+        imagenet_train_path = os.path.join(data_path, "imagenet/train")
+        if os.path.isdir(imagenet_train_path) and os.listdir(imagenet_train_path):
+            train_dataset = dsets.ImageFolder(
+                root=imagenet_train_path, transform=transform
+            )
+        else:
+            train_dataset = None
         val_dataset = dsets.ImageFolder(
             root=os.path.join(data_path, "imagenet/val"), transform=transform
         )
@@ -573,6 +582,8 @@ def get_datasets(dataset, transform, root_dir: Union[str, Path] = "./data", **kw
                 mapping_number_to_class[i] = line[:9].strip()
                 i += 1
         for d in [train_dataset, val_dataset]:
+            if d is None:
+                continue
             d.class_mapping_dict = class_mapping_dict
             d.class_mapping_dict_number = class_mapping_dict_number
             d.mapping_class_to_number = mapping_class_to_number
