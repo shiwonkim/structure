@@ -30,4 +30,6 @@ docker run --gpus all -it --shm-size=16g \
 - Model weights (DINOv2, RoBERTa, etc.) are NOT pre-cached in the image. They will be downloaded on first feature extraction run. After extraction, cached features are saved to disk and reused.
 - CUDA 11.8 is forward-compatible with CUDA 12.x host drivers (Server B driver 550).
 - Claude Code is pre-installed for interactive development.
-- Server A (NVIDIA driver 470): disable cuDNN with `torch.backends.cudnn.enabled = False` or use `run_dryrun.sh`.
+- Server A (NVIDIA driver 470): cuDNN works on torch 2.1.2; the historical
+  `run_dryrun.sh` cudnn-disable shim is no longer needed and has been
+  removed.

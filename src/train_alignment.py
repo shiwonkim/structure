@@ -208,5 +208,9 @@ if __name__ == "__main__":
         trainer = CLIPEvalTrainer(**trainer_kwargs)
     else:
         trainer = AlignmentTrainer(**trainer_kwargs)
-    trainer.fit(additional_unimodal_data=additional_unimodal_data)
+    trainer.fit(
+        additional_unimodal_data=additional_unimodal_data,
+        n_random_subsample_train=config["training"].get("n_random_subsample_train"),
+        n_random_subsample_val=config["training"].get("n_random_subsample_val"),
+    )
     del trainer

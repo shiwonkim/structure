@@ -11,27 +11,6 @@ features:
     pool_img: "cls"
     pool_txt: "avg" # last, avg
 
-    # Force a fixed input resolution for the vision encoder.
-    # 224 -> ViT-S/14: 16*16+1 = 257 tokens, ViT-L/14: 16*16+1 = 257 tokens.
-    # All experiments share the same per-(model, dataset, split, layer)
-    # token cache; CLS experiments slice tokens[:, 0, :], token experiments
-    # use the full (N, T, D) tensor. See IMPLEMENTATION.md for the
-    # unified extraction design.
-    img_size: 224
-
-    # When true, image-side token extraction (pool=none) writes one row
-    # per UNIQUE image_path instead of one row per (image, caption) pair.
-    # COCO has ~5 captions per image, so this saves ~5x extraction time
-    # AND ~5x disk space on the train cache (~250 GB at ViT-L). Text
-    # extraction stays at the full row count because each caption is
-    # genuinely different. fit() detects the deduped layout via shape
-    # and skips the redundant per-row dedup it would otherwise apply.
-    # Auto-disabled when:
-    #   - training.drop_duplicates is false
-    #   - training.n_dup_samples != 1
-    #   - n_random_subsample_train is set (dryrun first-N path)
-    image_dedup_extraction: true
-
     dataset: "coco"
     label_templates:
         - "a photo of a {label}"
@@ -137,12 +116,6 @@ evaluation:
         - 1_000
 
     drop_duplicates: false
-
-    # When true AND training.token_level=true, zero-shot classification
-    # runs through the BA-token CAP path (3D image tokens + 3D template
-    # tokens with mask) instead of the CLS fallback. False keeps the
-    # legacy CLS-only zero-shot eval. See IMPLEMENTATION.md.
-    token_level_zero_shot: false
 
     zero_shot_datasets:
         # Coarse concepts (e.g. ships, planes)

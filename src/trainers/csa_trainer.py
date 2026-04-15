@@ -12,6 +12,25 @@ from loguru import logger
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+# cca_zoo 2.5.0's MCCA._apply_pca uses sklearn PCA without filtering
+# zero-variance components, which produces NaNs when training CSA on
+# low-rank or zero-padded feature columns. Override the PCA fit to use
+# the variance-ratio mode (n_components=0.999) so zero-variance columns
+# are dropped automatically. Applied once at module import time so any
+# subsequent CSATrainer / NormalizedCCA call uses the safe variant.
+import cca_zoo.linear._mcca as _mcca  # noqa: E402
+from sklearn.decomposition import PCA as _SkPCA  # noqa: E402
+
+
+def _patched_apply_pca(self, views):
+    self.pca_models = [_SkPCA(n_components=0.999) for _ in views]
+    return [
+        self.pca_models[i].fit_transform(view) for i, view in enumerate(views)
+    ]
+
+
+_mcca.MCCA._apply_pca = _patched_apply_pca
+
 from src.alignment.cca_class import NormalizedCCA
 from src.core.src.utils.plotting import embedding_plot, embedding_plot_w_markers
 from src.dataset_preparation.data_utils import FeatureDataset, get_meta_dict

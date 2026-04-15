@@ -293,3 +293,10 @@ notebooks/tmp_models
 .python-version
 HuggingFaceCache/
 results/
+
+# Added during Server B prep cleanup
+logs/
+*.bak.*
+.claude/
+bridge-anchors/
+archive/

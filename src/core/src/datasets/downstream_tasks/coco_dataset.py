@@ -94,23 +94,23 @@ class CocoCaptionDataset(Dataset):
         return image, caption
 
     def load_image(self, f):
+        # Returns a PIL.Image so that the downstream transform pipeline
+        # (timm's create_transform: Resize -> CenterCrop -> ToTensor ->
+        # Normalize) can run end-to-end. Returning a torch.Tensor from
+        # here causes the timm pipeline's own ToTensor() to error on an
+        # already-tensor input — that was the bug previously worked
+        # around by run_with_totensor_fix.py.
         if self.jpeg_reader is not None:
             with open(f, "rb") as file:
                 try:
                     image = self.jpeg_reader.decode(file.read())
+                    if len(image.shape) == 2:
+                        image = image[..., np.newaxis].repeat(3, axis=-1)
+                    return Image.fromarray(image)
                 except OSError:
                     # fall back to PIL loading when there is a problem
                     # likely not a JPEG image
                     print(
                         f"Failed to read file with TurboJPEG falling back on PIL: {f}"
                     )
-                    image = Image.open(f)
-                    image = image.convert("RGB")
-                    image = np.array(image)
-        else:
-            image = Image.open(f)
-            image = image.convert("RGB")
-            image = np.array(image)
-        if len(image.shape) == 2:
-            image = image[..., np.newaxis].repeat(3, axis=-1)
-        return transforms.ToTensor()(image)
+        return Image.open(f).convert("RGB")

@@ -44,7 +44,19 @@ def build_zero_shot_classifier(
     pool_txt: str = "last",
     save_path: Optional[Path] = None,
     sample_by_sample_embedding: bool = False,
+    token_level: bool = False,
 ):
+    """Build per-class text anchors for zero-shot eval.
+
+    When ``token_level=True``:
+      * pooling is forced to ``"none"`` so we keep ``(BS, T, D)`` per layer,
+      * ``save_path`` is ignored (the per-template attention mask is not
+        cached anywhere, so re-loading would silently drop it),
+      * the alignment layer is called as ``alignment_layer(tokens, mask=…)``
+        so a CAP-style head can attend over the templated text tokens.
+    Template averaging happens AFTER CAP, on the K-dim profile, so each
+    template gets its own attention pattern.
+    """
     assert isinstance(templates, Sequence) and len(templates) > 0
     assert isinstance(classnames, Sequence) and len(classnames) > 0
 
@@ -62,6 +74,14 @@ def build_zero_shot_classifier(
         padding="longest",
         return_tensors="pt",
     )
+
+    if token_level:
+        # Token-level path requires the attention mask per batch, which
+        # the legacy cache file does not store. Disable caching outright
+        # so we always recompute (cheap: text templates are short).
+        save_path = None
+        # Force the per-batch slicing branch to keep the full token axis.
+        pool_txt = "none"
 
     if save_path is not None and save_path.exists():
         cached = True
@@ -147,7 +167,16 @@ def build_zero_shot_classifier(
                 class_embeddings = class_embeddings.float()
         # pass it through the alignment layer (for all classes * num_templates)
         if alignment_layer is not None:
-            class_embeddings = alignment_layer(class_embeddings)
+            if token_level:
+                # CAP-style head: pass the per-template attention mask so
+                # padding tokens are excluded from the softmax. The mask
+                # came in as int64; the BA-token layer cast-via .bool().
+                batch_attn_mask = token_inputs["attention_mask"].to(device)
+                class_embeddings = alignment_layer(
+                    class_embeddings, mask=batch_attn_mask
+                )
+            else:
+                class_embeddings = alignment_layer(class_embeddings)
         # reshape the embeddings so we have the template dimension
         class_embeddings = class_embeddings.reshape(
             class_embeddings.shape[0] // num_templates,

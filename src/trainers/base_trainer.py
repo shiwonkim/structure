@@ -156,6 +156,7 @@ class Trainer(ABC, object):
         start_lr: float = 1e-7,
         end_lr: float = 1.0,
         wandb_prefix: str = "",
+        text_mask_train=None,
     ):
         # save original model state to restore after finding LR
         alignment_image_state = deepcopy(alignment_image.state_dict())
@@ -184,6 +185,9 @@ class Trainer(ABC, object):
         indices = torch.randperm(image_features_train.shape[0])[:subset_size]
         image_features_subset = image_features_train[indices].float()
         text_features_subset = text_features_train[indices].float()
+        text_mask_subset = (
+            text_mask_train[indices] if text_mask_train is not None else None
+        )
 
         batch_size = min(self.train_batch_size, subset_size)
         logger.debug(
@@ -199,7 +203,13 @@ class Trainer(ABC, object):
                 optimizer.zero_grad()
 
                 aligned_img_feats = alignment_image(img_feats)
-                aligned_txt_feats = alignment_text(txt_feats)
+                if text_mask_subset is not None:
+                    txt_mask_batch = text_mask_subset[batch_idx].to(self.device)
+                    aligned_txt_feats = alignment_text(
+                        txt_feats, mask=txt_mask_batch
+                    )
+                else:
+                    aligned_txt_feats = alignment_text(txt_feats)
 
                 loss_dict = self.loss(
                     image_embeddings_aligned=aligned_img_feats,

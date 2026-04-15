@@ -48,7 +48,7 @@ class Flickr30kDataset(Dataset):
         df_split = pd.DataFrame(split_annotations, columns=["image_name", "split"])
         df_split["image_name"] = df_split["image_name"] + ".jpg"
         df_split["image_path"] = df_split["image_name"].apply(
-            lambda x: os.path.join(self.root_dir, "flickr30k_images", x)
+            lambda x: os.path.join(self.root_dir, "images", x)
         )
         self.df = self.df.merge(df_split, on="image_name", how="left")
         self.df.dropna(subset="comment", inplace=True)
@@ -101,23 +101,18 @@ class Flickr30kDataset(Dataset):
         return image, caption
 
     def load_image(self, f):
+        # Returns a PIL.Image so the downstream transform pipeline's
+        # ToTensor() runs on a PIL image (not a tensor). Mirrors the
+        # CocoCaptionDataset fix.
         if self.jpeg_reader is not None:
             with open(f, "rb") as file:
                 try:
                     image = self.jpeg_reader.decode(file.read())
+                    if len(image.shape) == 2:
+                        image = image[..., np.newaxis].repeat(3, axis=-1)
+                    return Image.fromarray(image)
                 except OSError:
-                    # fall back to PIL loading when there is a problem
-                    # likely not a JPEG image
                     print(
                         f"Failed to read file with TurboJPEG falling back on PIL: {f}"
                     )
-                    image = Image.open(f)
-                    image = image.convert("RGB")
-                    image = np.array(image)
-        else:
-            image = Image.open(f)
-            image = image.convert("RGB")
-            image = np.array(image)
-        if len(image.shape) == 2:
-            image = image[..., np.newaxis].repeat(3, axis=-1)
-        return transforms.ToTensor()(image)
+        return Image.open(f).convert("RGB")

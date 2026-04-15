@@ -1,0 +1,33 @@
+defaults: !include ../../default.yaml
+
+overrides:
+    # CSA (closed-form CCA) sim_dim=256, ViT-S + MiniLM (both 384d).
+    alignment:
+        llm_model_name: "sentence-transformers/all-MiniLM-L6-v2"
+        lvm_model_name: "vit_small_patch14_dinov2.lvd142m"
+
+    features:
+        batch_size: 64
+        num_workers: 4
+
+    training:
+        batch_size: 4096
+
+        cca: true
+        cca_kwargs:
+            sim_dim: 256
+            equal_weights: False
+            use_reg: False
+
+    layer_selection:
+        best_only: true
+        last_only: false
+
+    evaluation:
+        zero_shot_datasets:
+            - "cifar10"
+            - "stl10"
+            - "cifar100"
+            - "mnist"
+        retrieval_datasets:
+            - "coco"

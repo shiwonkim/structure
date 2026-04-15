@@ -139,10 +139,20 @@ class AlignmentTrainer(Trainer):
         return language_model, tokenizer
 
     def get_lvm(self, lvm_model_name: str):
-        vision_model = timm.create_model(lvm_model_name, pretrained=True)
-        transform = create_transform(
-            **resolve_data_config(vision_model.pretrained_cfg, model=vision_model)
+        img_size = self.config["features"].get("img_size")
+        model_kwargs = {}
+        if img_size is not None:
+            model_kwargs["img_size"] = int(img_size)
+        vision_model = timm.create_model(
+            lvm_model_name, pretrained=True, **model_kwargs
         )
+        data_config = resolve_data_config(
+            vision_model.pretrained_cfg, model=vision_model
+        )
+        if img_size is not None:
+            data_config["input_size"] = (3, int(img_size), int(img_size))
+            data_config["crop_pct"] = 1.0
+        transform = create_transform(**data_config)
         transform.transforms = [_ensure_rgb_image] + transform.transforms
 
         if "vit" in lvm_model_name:
@@ -190,7 +200,10 @@ class AlignmentTrainer(Trainer):
         assert loader.dataset.df.equals(_df)
         del _df
 
-        llm_feats = []
+        pool_txt_mode = self.config["features"]["pool_txt"]
+        llm_feats = None
+        offset = 0
+        total_n = len(loader.dataset)
         for batch in tqdm(loader, total=len(loader), file=sys.stdout):
             _, token_inputs = batch
             token_inputs = {
@@ -208,7 +221,7 @@ class AlignmentTrainer(Trainer):
                         input_ids=token_inputs["input_ids"],
                         attention_mask=token_inputs["attention_mask"],
                     )
-                if self.config["features"]["pool_txt"] == "avg":
+                if pool_txt_mode == "avg":
                     # swap the backsize to the first dimension
                     # (BS, Layers, Tokens, Dim)
                     feats = torch.stack(llm_output["hidden_states"]).permute(1, 0, 2, 3)
@@ -216,10 +229,10 @@ class AlignmentTrainer(Trainer):
                     mask = token_inputs["attention_mask"].unsqueeze(-1).unsqueeze(1)
                     # average along the token dimension
                     feats = (feats * mask).sum(2) / mask.sum(2)
-                elif self.config["features"]["pool_txt"] == "last":
+                elif pool_txt_mode == "last":
                     feats = [v[:, -1, :] for v in llm_output["hidden_states"]]
                     feats = torch.stack(feats).permute(1, 0, 2)
-                elif self.config["features"]["pool_txt"] == "none":
+                elif pool_txt_mode == "none":
                     assert self.config["features"].get("layer_txt") is not None
                     feats = torch.stack(list(llm_output["hidden_states"]))
                     # permute to dim: (bs, layers, tokens, dim)
@@ -227,11 +240,27 @@ class AlignmentTrainer(Trainer):
                     # select only the layer we care about, otherwise we don't have enough memory
                     feats = feats[:, self.config["features"]["layer_txt"], :, :]
                 else:
-                    raise NotImplementedError(
-                        f"unknown pooling {self.config['features']['pool_txt']}"
-                    )
-                llm_feats.append(feats.cpu())
-        llm_feats = torch.cat(llm_feats).cpu()
+                    raise NotImplementedError(f"unknown pooling {pool_txt_mode}")
+
+                if pool_txt_mode == "none":
+                    feats_cpu = feats.to(dtype=torch.float16).cpu()
+                    if llm_feats is None:
+                        _, T, D = feats_cpu.shape
+                        llm_feats = torch.empty(
+                            (total_n, T, D), dtype=torch.float16
+                        )
+                    bs = feats_cpu.shape[0]
+                    llm_feats[offset : offset + bs] = feats_cpu
+                    offset += bs
+                else:
+                    if llm_feats is None:
+                        llm_feats = []
+                    llm_feats.append(feats.cpu())
+        if pool_txt_mode == "none":
+            if offset < total_n:
+                llm_feats = llm_feats[:offset]
+        else:
+            llm_feats = torch.cat(llm_feats).cpu()
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_dict = {"features": llm_feats}
         if hasattr(loader.dataset, "df"):
@@ -247,6 +276,7 @@ class AlignmentTrainer(Trainer):
         lvm_model_name: str,
         suffix: str = "",
         dataset_name: Optional[str] = None,
+        allow_image_dedup: bool = True,
     ):
         if hasattr(loader.dataset, "name"):
             dataset_name = loader.dataset.name
@@ -270,17 +300,71 @@ class AlignmentTrainer(Trainer):
             image_transform=image_transform,
         )
 
-        lvm_feats = []
-        for batch in tqdm(loader, total=len(loader), file=sys.stdout):
+        pool_mode = self.config["features"]["pool_img"]
+        # Image-side dedup at extraction: pool=none caches duplicate the same
+        # image 5x in COCO (one row per caption). Detect that and iterate
+        # only the first-occurrence rows of each unique image_path. Saves
+        # ~5x extraction time and ~5x disk on the train cache. fit() detects
+        # the deduped layout via shape and skips the redundant per-row
+        # dedup it would otherwise apply.
+        is_deduped_extraction = False
+        unique_to_full_idx = None
+        if (
+            pool_mode == "none"
+            and allow_image_dedup
+            and self._should_dedup_image_extraction(loader)
+        ):
+            df = loader.dataset.df
+            first_idx_mask = (df.groupby("image_path").cumcount() == 0).values
+            keep_indices = np.where(first_idx_mask)[0].tolist()
+            n_unique = len(keep_indices)
+            n_full = len(df)
+            logger.info(
+                f"Image dedup at extraction: {n_full:,} caption-image pairs -> "
+                f"{n_unique:,} unique images "
+                f"(saves {(1 - n_unique / n_full) * 100:.1f}% of vision forwards)"
+            )
+            unique_view = self._indexed_dataset_view(loader.dataset, keep_indices)
+            from torch.utils.data import DataLoader as _DataLoader
+
+            iter_loader = _DataLoader(
+                unique_view,
+                batch_size=loader.batch_size,
+                shuffle=False,
+                num_workers=getattr(loader, "num_workers", 0),
+                pin_memory=False,
+                drop_last=False,
+                collate_fn=getattr(loader, "collate_fn", None),
+            )
+            iter_total_n = n_unique
+            # Build the caption -> image-row mapping for the sidecar
+            unique_paths = df.loc[first_idx_mask, "image_path"].reset_index(drop=True)
+            path_to_pos = {p: i for i, p in enumerate(unique_paths)}
+            unique_to_full_idx = torch.tensor(
+                df["image_path"].map(path_to_pos).values, dtype=torch.long
+            )
+            is_deduped_extraction = True
+        else:
+            iter_loader = loader
+            iter_total_n = len(loader.dataset)
+
+        # Streaming allocation path for pool=none: token features are huge
+        # (591K * 257 * 384 * 4 = 234 GB for full COCO float32), so we
+        # pre-allocate a single float16 tensor and fill it by offset to
+        # avoid torch.cat's 2x peak memory.
+        lvm_feats = None
+        offset = 0
+        total_n = iter_total_n
+        for batch in tqdm(iter_loader, total=len(iter_loader), file=sys.stdout):
             images, _ = batch
             with torch.no_grad():
                 images = images.to(self.device, non_blocking=True)
                 lvm_output = vision_model(images)
-                if self.config["features"]["pool_img"] == "cls":
+                if pool_mode == "cls":
                     # extract the class token for all layers
                     feats = [v[:, 0, :] for v in lvm_output.values()]
                     feats = torch.stack(feats).permute(1, 0, 2)
-                elif self.config["features"]["pool_img"] == "none":
+                elif pool_mode == "none":
                     assert self.config["features"].get("layer_img") is not None
                     feats = torch.stack(list(lvm_output.values()))
                     # permute to dim: (bs, layers, tokens, dim)
@@ -288,14 +372,40 @@ class AlignmentTrainer(Trainer):
                     # select only the layer we care about, otherwise we don't have enough memory
                     feats = feats[:, self.config["features"]["layer_img"], :, :]
                 else:
-                    raise NotImplementedError(
-                        f"unknown pooling {self.config['features']['pool_img']}"
-                    )
-                lvm_feats.append(feats.cpu())
-        lvm_feats = torch.cat(lvm_feats).cpu()
+                    raise NotImplementedError(f"unknown pooling {pool_mode}")
+
+                if pool_mode == "none":
+                    feats_cpu = feats.to(dtype=torch.float16).cpu()
+                    if lvm_feats is None:
+                        _, T, D = feats_cpu.shape
+                        lvm_feats = torch.empty(
+                            (total_n, T, D), dtype=torch.float16
+                        )
+                    bs = feats_cpu.shape[0]
+                    lvm_feats[offset : offset + bs] = feats_cpu
+                    offset += bs
+                else:
+                    if lvm_feats is None:
+                        lvm_feats = []
+                    lvm_feats.append(feats.cpu())
+        if pool_mode == "none":
+            if offset < total_n:
+                lvm_feats = lvm_feats[:offset]
+        else:
+            lvm_feats = torch.cat(lvm_feats).cpu()
         save_path.parent.mkdir(parents=True, exist_ok=True)
         save_dict = {"features": lvm_feats}
-        if hasattr(loader.dataset, "df"):
+        if is_deduped_extraction:
+            save_dict["is_image_deduped"] = True
+            save_dict["unique_to_full_idx"] = unique_to_full_idx
+            # Persist the unique-row df so future loaders can rebuild
+            # mappings without re-reading the original annotations.
+            save_dict["dataframe"] = (
+                loader.dataset.df.loc[
+                    loader.dataset.df.groupby("image_path").cumcount() == 0
+                ].reset_index(drop=True)
+            )
+        elif hasattr(loader.dataset, "df"):
             save_dict["dataframe"] = loader.dataset.df
         torch.save(save_dict, save_path)
         logger.debug(f"Saved features to: {save_path}")
@@ -447,6 +557,441 @@ class AlignmentTrainer(Trainer):
 
         return sampled_df_alignment
 
+    def _subsampled_loader(self, loader, max_samples: Optional[int]):
+        """Return a DataLoader restricted to the first ``max_samples`` items.
+
+        The returned loader wraps the same underlying dataset as ``loader``
+        but delegates length to ``max_samples``. All attribute access falls
+        through to the wrapped dataset so downstream code that reads
+        ``dataset.df`` / ``dataset.name`` / ``dataset.tokenizer`` /
+        ``dataset.apply_tokenizer`` still works. If ``max_samples`` is None
+        or ``>=`` the dataset size, the original loader is returned unchanged.
+        """
+        base_dataset = loader.dataset
+        n = len(base_dataset)
+        if max_samples is None or max_samples >= n:
+            return loader
+
+        class _SubsetView:
+            """Dataset proxy that truncates to the first ``k`` samples.
+
+            The view forwards all attribute reads AND writes to the wrapped
+            dataset so that ``loader.dataset.tokenizer = ...`` and
+            ``loader.dataset.apply_tokenizer()`` mutate the real object's
+            state. It only overrides ``__len__``, ``__getitem__`` and the
+            ``df`` property (returning a sliced view).
+            """
+
+            _PROXY_ATTRS = {"_dataset", "_k"}
+
+            def __init__(self, dataset, k):
+                object.__setattr__(self, "_dataset", dataset)
+                object.__setattr__(self, "_k", k)
+
+            def __len__(self):
+                return self._k
+
+            def __getitem__(self, index):
+                return self._dataset[index]
+
+            def __getattr__(self, name):
+                # only called when attribute is NOT found on self
+                return getattr(self._dataset, name)
+
+            def __setattr__(self, name, value):
+                if name in type(self)._PROXY_ATTRS:
+                    object.__setattr__(self, name, value)
+                else:
+                    setattr(self._dataset, name, value)
+
+            @property
+            def df(self):
+                inner_df = getattr(self._dataset, "df", None)
+                if inner_df is None:
+                    return None
+                return inner_df.iloc[: self._k].reset_index(drop=True)
+
+        view = _SubsetView(base_dataset, max_samples)
+
+        from torch.utils.data import DataLoader
+
+        collate_fn = getattr(loader, "collate_fn", None)
+        return DataLoader(
+            view,
+            batch_size=loader.batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+            drop_last=False,
+            collate_fn=collate_fn,
+        )
+
+    def _indexed_dataset_view(self, base_dataset, keep_indices):
+        """Dataset proxy that yields only the rows in ``keep_indices``.
+
+        Mirrors ``_SubsetView`` (read+write attribute delegation, df
+        property override) but supports an arbitrary index list instead
+        of a first-N truncation. Used by image-side dedup at extraction.
+        """
+
+        class _IndexedView:
+            _PROXY_ATTRS = {"_dataset", "_indices"}
+
+            def __init__(self, dataset, indices):
+                object.__setattr__(self, "_dataset", dataset)
+                object.__setattr__(self, "_indices", list(indices))
+
+            def __len__(self):
+                return len(self._indices)
+
+            def __getitem__(self, i):
+                return self._dataset[self._indices[i]]
+
+            def __getattr__(self, name):
+                return getattr(self._dataset, name)
+
+            def __setattr__(self, name, value):
+                if name in type(self)._PROXY_ATTRS:
+                    object.__setattr__(self, name, value)
+                else:
+                    setattr(self._dataset, name, value)
+
+            @property
+            def df(self):
+                inner_df = getattr(self._dataset, "df", None)
+                if inner_df is None:
+                    return None
+                return inner_df.iloc[self._indices].reset_index(drop=True)
+
+        return _IndexedView(base_dataset, keep_indices)
+
+    def _should_dedup_image_extraction(self, loader) -> bool:
+        """Decide whether to apply image-dedup-at-extraction for this loader.
+
+        Returns True only when:
+          - the config flag ``features.image_dedup_extraction`` is on,
+          - the dataset has a ``df`` with an ``image_path`` column,
+          - that df has duplicate image_paths,
+          - training.drop_duplicates is true and n_dup_samples == 1
+            (so the trainer would otherwise dedup to first-occurrence anyway),
+          - no n_random_subsample_train cap is set (the dryrun first-N path
+            doesn't benefit and would interact awkwardly with dedup).
+        """
+        if not self.config["features"].get("image_dedup_extraction", False):
+            return False
+        ds = loader.dataset
+        if not hasattr(ds, "df"):
+            return False
+        df = ds.df
+        if df is None or "image_path" not in df.columns:
+            return False
+        if not df["image_path"].duplicated().any():
+            return False
+        if not self.config["training"].get("drop_duplicates", False):
+            return False
+        if int(self.config["training"].get("n_dup_samples", 1)) != 1:
+            return False
+        if self.config["training"].get("n_random_subsample_train") is not None:
+            return False
+        return True
+
+    def _load_token_features_for_layer(
+        self,
+        img_layer_idx: int,
+        txt_layer_idx: int,
+    ):
+        """Load / extract token features at the given layer pair.
+
+        Returns a dict with keys:
+            img_train, txt_train, txt_mask_train,
+            img_val,   txt_val,   txt_mask_val
+
+        Image features are (N, T_img, D_img) float tensors.
+        Text features are (N, T_txt, D_txt) float tensors.
+        Text masks are (N, T_txt) int64 tensors (1=valid, 0=pad).
+
+        Image masks are not needed (ViT uses all 1+num_patches tokens).
+
+        This method temporarily overrides ``features.pool_img`` /
+        ``features.pool_txt`` / ``features.layer_{img,txt}`` to reuse
+        STRUCTURE's existing ``pool=none`` single-layer extraction path,
+        then restores the original config. It also respects the
+        ``training.n_random_subsample_{train,val}`` limits by wrapping the
+        loaders in a subset view — token features are heavy (ViT-S/14
+        produces 1370 tokens per image at DINOv2's default 518×518 input),
+        and the dry-run path would otherwise balloon disk + memory usage.
+        """
+        orig_cfg = self.config["features"]
+        save_pool_img = orig_cfg.get("pool_img")
+        save_pool_txt = orig_cfg.get("pool_txt")
+        save_layer_img = orig_cfg.get("layer_img")
+        save_layer_txt = orig_cfg.get("layer_txt")
+
+        orig_cfg["pool_img"] = "none"
+        orig_cfg["pool_txt"] = "none"
+        orig_cfg["layer_img"] = int(img_layer_idx)
+        orig_cfg["layer_txt"] = int(txt_layer_idx)
+
+        # cap extraction to the effective training subset size
+        max_train = self.config["training"].get("n_random_subsample_train")
+        max_val = self.config["training"].get("n_random_subsample_val")
+        train_loader = self._subsampled_loader(self.train_dataset, max_train)
+        val_loader = self._subsampled_loader(self.val_dataset, max_val)
+        # suffix gets a -n{N} tag when using a subset so the cache is
+        # distinct from the "full" extraction
+        train_tag = f"-n{max_train}" if max_train is not None else ""
+        val_tag = f"-n{max_val}" if max_val is not None else ""
+
+        img_size = orig_cfg.get("img_size")
+        res_tag = f"-r{int(img_size)}" if img_size is not None else ""
+        try:
+            img_suffix = f"none_layer-{int(img_layer_idx)}{res_tag}"
+            txt_suffix = f"none_layer-{int(txt_layer_idx)}"
+
+            img_train = self.get_image_features(
+                loader=train_loader,
+                lvm_model_name=self.lvm_model_name,
+                suffix=f"train-{img_suffix}{train_tag}",
+            )
+            img_val = self.get_image_features(
+                loader=val_loader,
+                lvm_model_name=self.lvm_model_name,
+                suffix=f"val-{img_suffix}{val_tag}",
+            )
+            txt_train = self.get_text_features(
+                loader=train_loader,
+                llm_model_name=self.llm_model_name,
+                suffix=f"train-{txt_suffix}{train_tag}",
+            )
+            txt_val = self.get_text_features(
+                loader=val_loader,
+                llm_model_name=self.llm_model_name,
+                suffix=f"val-{txt_suffix}{val_tag}",
+            )
+            txt_mask_train = self._load_or_build_text_mask(
+                loader=train_loader,
+                llm_model_name=self.llm_model_name,
+                suffix=f"train-{txt_suffix}{train_tag}",
+            )
+            txt_mask_val = self._load_or_build_text_mask(
+                loader=val_loader,
+                llm_model_name=self.llm_model_name,
+                suffix=f"val-{txt_suffix}{val_tag}",
+            )
+        finally:
+            # restore original pooling config so the rest of the pipeline
+            # (eval, layer-selection metadata, etc.) behaves normally
+            orig_cfg["pool_img"] = save_pool_img
+            orig_cfg["pool_txt"] = save_pool_txt
+            if save_layer_img is None:
+                orig_cfg.pop("layer_img", None)
+            else:
+                orig_cfg["layer_img"] = save_layer_img
+            if save_layer_txt is None:
+                orig_cfg.pop("layer_txt", None)
+            else:
+                orig_cfg["layer_txt"] = save_layer_txt
+
+        return {
+            "img_train": img_train,
+            "txt_train": txt_train,
+            "txt_mask_train": txt_mask_train,
+            "img_val": img_val,
+            "txt_val": txt_val,
+            "txt_mask_val": txt_mask_val,
+        }
+
+    def _load_or_build_text_mask(
+        self, loader, llm_model_name: str, suffix: str
+    ) -> torch.Tensor:
+        """Load cached text attention mask, or tokenise the loader to build one.
+
+        The main ``get_text_features`` call doesn't persist masks — we write a
+        companion file next to the features cache with the same base name
+        plus ``_mask`` suffix.
+        """
+        dataset_name = (
+            loader.dataset.name
+            if hasattr(loader.dataset, "name")
+            else type(loader.dataset).__name__
+        )
+        features_path = AlignmentTrainer.get_feature_save_path(
+            m_name=llm_model_name,
+            d_name=dataset_name,
+            save_path=self.save_path,
+            suffix=suffix,
+        )
+        mask_path = features_path.with_name(
+            features_path.stem + "_mask" + features_path.suffix
+        )
+        if mask_path.exists():
+            payload = torch.load(mask_path, weights_only=False)
+            logger.debug(f"Loaded text mask from: {mask_path}")
+            return payload["mask"]
+
+        # Build masks by re-running the tokenizer over the dataloader.
+        _, tokenizer = self.get_llm(llm_model_name=llm_model_name)
+        loader.dataset.tokenizer = tokenizer
+        if hasattr(loader.dataset, "loading_type"):
+            loader.dataset.loading_type = LoadingType.TXT_ONLY
+        loader.dataset.apply_tokenizer()
+
+        masks = []
+        for batch in tqdm(
+            loader, total=len(loader), file=sys.stdout, desc=f"text-mask[{suffix}]"
+        ):
+            _, token_inputs = batch
+            masks.append(token_inputs["attention_mask"].cpu())
+        mask = torch.cat(masks, dim=0)
+
+        mask_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"mask": mask}, mask_path)
+        logger.debug(f"Saved text mask to: {mask_path}")
+        return mask
+
+    def _load_eval_token_features(
+        self,
+        eval_loader,
+        img_layer_idx: int,
+        txt_layer_idx: int,
+    ):
+        """Load (or extract) token features + text mask for a retrieval eval set.
+
+        Temporarily flips ``pool_img``/``pool_txt`` to ``none`` and pins the
+        layer indices so that ``get_image_features``/``get_text_features``
+        write a single-layer token cache. Uses a distinct ``eval-*`` suffix
+        so it does not collide with training caches.
+        """
+        orig_cfg = self.config["features"]
+        save_pool_img = orig_cfg.get("pool_img")
+        save_pool_txt = orig_cfg.get("pool_txt")
+        save_layer_img = orig_cfg.get("layer_img")
+        save_layer_txt = orig_cfg.get("layer_txt")
+
+        orig_cfg["pool_img"] = "none"
+        orig_cfg["pool_txt"] = "none"
+        orig_cfg["layer_img"] = int(img_layer_idx)
+        orig_cfg["layer_txt"] = int(txt_layer_idx)
+
+        img_size = orig_cfg.get("img_size")
+        res_tag = f"-r{int(img_size)}" if img_size is not None else ""
+        img_suffix = f"eval-none_layer-{int(img_layer_idx)}{res_tag}"
+        txt_suffix = f"eval-none_layer-{int(txt_layer_idx)}"
+        try:
+            # Eval val cache MUST stay aligned 1:1 with the eval text cache
+            # (same row count) because the retrieval per-batch loop slices
+            # both with a shared `i` index. Disable image dedup here.
+            img_feats = self.get_image_features(
+                loader=eval_loader,
+                lvm_model_name=self.lvm_model_name,
+                suffix=img_suffix,
+                allow_image_dedup=False,
+            )
+            txt_feats = self.get_text_features(
+                loader=eval_loader,
+                llm_model_name=self.llm_model_name,
+                suffix=txt_suffix,
+            )
+            txt_mask = self._load_or_build_text_mask(
+                loader=eval_loader,
+                llm_model_name=self.llm_model_name,
+                suffix=txt_suffix,
+            )
+        finally:
+            orig_cfg["pool_img"] = save_pool_img
+            orig_cfg["pool_txt"] = save_pool_txt
+            if save_layer_img is None:
+                orig_cfg.pop("layer_img", None)
+            else:
+                orig_cfg["layer_img"] = save_layer_img
+            if save_layer_txt is None:
+                orig_cfg.pop("layer_txt", None)
+            else:
+                orig_cfg["layer_txt"] = save_layer_txt
+        return img_feats, txt_feats, txt_mask
+
+    # ---------------------------------------------------------------------
+    # Unified token-cache loaders
+    # ---------------------------------------------------------------------
+    # The unified pipeline extracts (N, T, D) image / (N, S, D) text token
+    # tensors once per (model, dataset, split, layer, img_size). Both the
+    # CLS-style (pool=cls/avg) and the token-level training paths can then
+    # be served from the same files:
+    #   image CLS  -> tokens[:, 0, :]
+    #   image full -> tokens
+    #   text  avg  -> masked mean over the sequence dim
+    #   text  full -> tokens (+ mask)
+    # The helpers below check for a token cache before falling back to the
+    # legacy multi-layer extraction.
+
+    def _unified_image_token_path(
+        self, dataset_name: str, split_tag: str, layer_idx: int
+    ) -> Path:
+        img_size = self.config["features"].get("img_size")
+        res_tag = f"-r{int(img_size)}" if img_size is not None else ""
+        suffix = f"{split_tag}-none_layer-{int(layer_idx)}{res_tag}"
+        return AlignmentTrainer.get_feature_save_path(
+            m_name=self.lvm_model_name,
+            d_name=dataset_name,
+            save_path=self.save_path,
+            suffix=suffix,
+        )
+
+    def _unified_text_token_path(
+        self, dataset_name: str, split_tag: str, layer_idx: int
+    ) -> Tuple[Path, Path]:
+        suffix = f"{split_tag}-none_layer-{int(layer_idx)}"
+        feats_path = AlignmentTrainer.get_feature_save_path(
+            m_name=self.llm_model_name,
+            d_name=dataset_name,
+            save_path=self.save_path,
+            suffix=suffix,
+        )
+        mask_path = feats_path.with_name(
+            feats_path.stem + "_mask" + feats_path.suffix
+        )
+        return feats_path, mask_path
+
+    def _try_load_image_cls_from_tokens(
+        self, dataset_name: str, split_tag: str, layer_idx: int
+    ) -> Optional[torch.Tensor]:
+        """If a unified image token cache exists, return CLS slice (N, D)."""
+        path = self._unified_image_token_path(
+            dataset_name=dataset_name, split_tag=split_tag, layer_idx=layer_idx
+        )
+        if not path.exists():
+            return None
+        payload = torch.load(path, weights_only=False)
+        feats = payload["features"]
+        # tokens[:, 0, :] is the CLS token under DINOv2's standard layout.
+        cls = feats[:, 0, :].contiguous()
+        logger.debug(
+            f"Derived CLS from unified token cache: {path} "
+            f"shape={tuple(cls.shape)} dtype={cls.dtype}"
+        )
+        return cls
+
+    def _try_load_text_avg_from_tokens(
+        self, dataset_name: str, split_tag: str, layer_idx: int
+    ) -> Optional[torch.Tensor]:
+        """If a unified text token + mask cache exists, return masked mean."""
+        feats_path, mask_path = self._unified_text_token_path(
+            dataset_name=dataset_name, split_tag=split_tag, layer_idx=layer_idx
+        )
+        if not (feats_path.exists() and mask_path.exists()):
+            return None
+        feats = torch.load(feats_path, weights_only=False)["features"]
+        mask = torch.load(mask_path, weights_only=False)["mask"]
+        # masked mean over the sequence axis: (feats * mask).sum(1) / mask.sum(1)
+        m = mask.to(dtype=feats.dtype).unsqueeze(-1)
+        denom = m.sum(dim=1).clamp(min=1)
+        avg = (feats * m).sum(dim=1) / denom
+        logger.debug(
+            f"Derived masked-mean text features from unified token cache: "
+            f"{feats_path} shape={tuple(avg.shape)} dtype={avg.dtype}"
+        )
+        return avg
+
     def fit(
         self,
         n_random_subsample_train: Optional[int] = None,
@@ -457,53 +1002,152 @@ class AlignmentTrainer(Trainer):
         # pre-compute the embeddings from both modalities
         # first embed the validation set since we're returning
         # the models for the training set
-        image_val_suffix = f"val-{self.config['features']['pool_img']}"
+        # Only tag the cache with layer index when using single-layer
+        # (pool=none) extraction. pool=cls/avg features include all layers,
+        # so the suffix must stay layer-agnostic to hit the shared cache.
+        # img_size in the suffix guards against mixing 224 and 518 caches.
+        pool_img = self.config["features"]["pool_img"]
+        pool_txt = self.config["features"]["pool_txt"]
+        img_size_cfg = self.config["features"].get("img_size")
+        res_tag = f"-r{int(img_size_cfg)}" if img_size_cfg is not None else ""
+        cfg_layer_img = self.config["features"].get("layer_img")
+        cfg_layer_txt = self.config["features"].get("layer_txt")
+
+        # Unified-cache fast path: when the layer is pinned and a
+        # (N, T, D) token cache already exists, derive the (N, D)
+        # CLS / masked-mean view from it and skip the multi-layer
+        # extraction. Also when token_level=true, skip the CLS pre-load
+        # entirely — the token override later in fit() supplies the
+        # real tensors and the CLS pre-load is wasted compute.
+        token_level_cfg = bool(self.config["training"].get("token_level", False))
+
+        def _train_dataset_name(loader):
+            if hasattr(loader.dataset, "name"):
+                return loader.dataset.name
+            return type(loader.dataset).__name__
+
+        train_ds_name = _train_dataset_name(self.train_dataset)
+        val_ds_name = _train_dataset_name(self.val_dataset)
+
+        image_val_suffix = f"val-{pool_img}"
         if self.image_features_val is None:
-            if self.config["features"].get("layer_img") is not None:
-                image_val_suffix += f"_layer-{self.config['features']['layer_img']}"
-            image_features_val = self.get_image_features(
-                loader=self.val_dataset,
-                lvm_model_name=self.lvm_model_name,
-                suffix=image_val_suffix,
-            )
+            if (
+                pool_img == "none"
+                and cfg_layer_img is not None
+            ):
+                image_val_suffix += f"_layer-{cfg_layer_img}"
+            image_val_suffix += res_tag
+
+            image_features_val = None
+            if cfg_layer_img is not None and pool_img != "none":
+                # Try unified-cache-derived CLS first (avoids multi-layer extraction).
+                derived = self._try_load_image_cls_from_tokens(
+                    dataset_name=val_ds_name,
+                    split_tag="val",
+                    layer_idx=cfg_layer_img,
+                )
+                if derived is not None:
+                    image_features_val = derived
+            if image_features_val is None:
+                if token_level_cfg and cfg_layer_img is not None:
+                    # Skip: tokens will be loaded later. Use a tiny stub
+                    # that satisfies shape/dim checks without extraction.
+                    image_features_val = torch.zeros(
+                        (len(self.val_dataset.dataset), 1),
+                        dtype=torch.float32,
+                    )
+                else:
+                    image_features_val = self.get_image_features(
+                        loader=self.val_dataset,
+                        lvm_model_name=self.lvm_model_name,
+                        suffix=image_val_suffix,
+                    )
         else:
             image_features_val = self.image_features_val
 
-        text_val_suffix = f"val-{self.config['features']['pool_txt']}"
+        text_val_suffix = f"val-{pool_txt}"
         if self.text_features_val is None:
-            if self.config["features"].get("layer_img") is not None:
-                text_val_suffix += f"_layer-{self.config['features']['layer_txt']}"
-            text_features_val = self.get_text_features(
-                loader=self.val_dataset,
-                llm_model_name=self.llm_model_name,
-                suffix=text_val_suffix,
-            )
+            if (
+                pool_txt == "none"
+                and cfg_layer_txt is not None
+            ):
+                text_val_suffix += f"_layer-{cfg_layer_txt}"
+
+            text_features_val = None
+            if cfg_layer_txt is not None and pool_txt != "none":
+                derived = self._try_load_text_avg_from_tokens(
+                    dataset_name=val_ds_name,
+                    split_tag="val",
+                    layer_idx=cfg_layer_txt,
+                )
+                if derived is not None:
+                    text_features_val = derived
+            if text_features_val is None:
+                if token_level_cfg and cfg_layer_txt is not None:
+                    text_features_val = torch.zeros(
+                        (len(self.val_dataset.dataset), 1),
+                        dtype=torch.float32,
+                    )
+                else:
+                    text_features_val = self.get_text_features(
+                        loader=self.val_dataset,
+                        llm_model_name=self.llm_model_name,
+                        suffix=text_val_suffix,
+                    )
         else:
             text_features_val = self.text_features_val
 
         if self.image_features_train is None:
-            image_features_train = self.get_image_features(
-                loader=self.train_dataset,
-                lvm_model_name=self.lvm_model_name,
-                suffix=image_val_suffix.replace("val-", "train-"),
-            )
+            image_features_train = None
+            if cfg_layer_img is not None and pool_img != "none":
+                derived = self._try_load_image_cls_from_tokens(
+                    dataset_name=train_ds_name,
+                    split_tag="train",
+                    layer_idx=cfg_layer_img,
+                )
+                if derived is not None:
+                    image_features_train = derived
+            if image_features_train is None:
+                if token_level_cfg and cfg_layer_img is not None:
+                    image_features_train = torch.zeros(
+                        (len(self.train_dataset.dataset), 1),
+                        dtype=torch.float32,
+                    )
+                else:
+                    image_features_train = self.get_image_features(
+                        loader=self.train_dataset,
+                        lvm_model_name=self.lvm_model_name,
+                        suffix=image_val_suffix.replace("val-", "train-"),
+                    )
         else:
             image_features_train = self.image_features_train
 
         if self.text_features_train is None:
-            text_features_train = self.get_text_features(
-                loader=self.train_dataset,
-                llm_model_name=self.llm_model_name,
-                suffix=text_val_suffix.replace("val-", "train-"),
-            )
+            text_features_train = None
+            if cfg_layer_txt is not None and pool_txt != "none":
+                derived = self._try_load_text_avg_from_tokens(
+                    dataset_name=train_ds_name,
+                    split_tag="train",
+                    layer_idx=cfg_layer_txt,
+                )
+                if derived is not None:
+                    text_features_train = derived
+            if text_features_train is None:
+                if token_level_cfg and cfg_layer_txt is not None:
+                    text_features_train = torch.zeros(
+                        (len(self.train_dataset.dataset), 1),
+                        dtype=torch.float32,
+                    )
+                else:
+                    text_features_train = self.get_text_features(
+                        loader=self.train_dataset,
+                        llm_model_name=self.llm_model_name,
+                        suffix=text_val_suffix.replace("val-", "train-"),
+                    )
         else:
             text_features_train = self.text_features_train
         image_dim = image_features_train.shape[-1]
         text_dim = text_features_train.shape[-1]
-
-        # check that we have the same samples
-        assert image_features_train.shape[0] == text_features_train.shape[0]
-        assert image_features_val.shape[0] == text_features_val.shape[0]
 
         # cache features if wanted
         self.image_features_val = image_features_val
@@ -511,6 +1155,14 @@ class AlignmentTrainer(Trainer):
         self.text_features_val = text_features_val
         self.text_features_train = text_features_train
 
+        # Compute drop_duplicates index masks ONCE so both the CLS path
+        # (mutates here) and the token-level override (later in the
+        # combo loop) can apply the same selection. Without this, the
+        # token override would silently bypass dedup and train on the
+        # full caption-image cross product (591K) instead of the
+        # deduped 118K.
+        sel_train_indices = None
+        sel_val_indices = None
         if (
             self.config["training"]["drop_duplicates"]
             and hasattr(self.train_dataset.dataset, "df")
@@ -520,16 +1172,52 @@ class AlignmentTrainer(Trainer):
                 self.train_dataset.dataset.df.groupby("image_path").cumcount()
                 < self.config["training"]["n_dup_samples"]
             )
-            image_features_train = image_features_train[sel_train_indices]
-            text_features_train = text_features_train[sel_train_indices]
-
             sel_val_indices = (
                 self.val_dataset.dataset.df.groupby("image_path").cumcount()
                 < self.config["training"]["n_dup_samples"]
             )
-            image_features_val = image_features_val[sel_val_indices]
-            text_features_val = text_features_val[sel_val_indices]
 
+        # Apply the dedup mask per-tensor: when image was deduped at
+        # extraction time (118K rows) but text is still 591K, we apply
+        # the mask only to the tensor whose row count matches the mask
+        # length. After this block all four tensors are at the same
+        # row count.
+        def _apply_if_full(tensor, mask_full, mask_bool):
+            if (
+                mask_bool is not None
+                and tensor is not None
+                and tensor.shape[0] == mask_full
+            ):
+                return tensor[mask_bool]
+            return tensor
+
+        if sel_train_indices is not None:
+            full_train_n = len(sel_train_indices)
+            image_features_train = _apply_if_full(
+                image_features_train, full_train_n, sel_train_indices
+            )
+            text_features_train = _apply_if_full(
+                text_features_train, full_train_n, sel_train_indices
+            )
+        if sel_val_indices is not None:
+            full_val_n = len(sel_val_indices)
+            image_features_val = _apply_if_full(
+                image_features_val, full_val_n, sel_val_indices
+            )
+            text_features_val = _apply_if_full(
+                text_features_val, full_val_n, sel_val_indices
+            )
+
+        # check that we have the same samples — assertion AFTER dedup so
+        # the deduped-image-extraction case (118K vs 591K pre-dedup) is
+        # handled correctly.
+        assert image_features_train.shape[0] == text_features_train.shape[0]
+        assert image_features_val.shape[0] == text_features_val.shape[0]
+
+        # remember the subsample permutations so token-level loading can
+        # replay them on the fresh token tensors
+        token_subsample_train_idx = None
+        token_subsample_val_idx = None
         if (
             n_random_subsample_train is not None
             and n_random_subsample_train < image_features_train.shape[0]
@@ -545,6 +1233,7 @@ class AlignmentTrainer(Trainer):
             ]
             image_features_train = image_features_train[random_sequence]
             text_features_train = text_features_train[random_sequence]
+            token_subsample_train_idx = random_sequence
         if (
             n_random_subsample_val is not None
             and n_random_subsample_val < image_features_val.shape[0]
@@ -560,6 +1249,7 @@ class AlignmentTrainer(Trainer):
             ]
             image_features_val = image_features_val[random_sequence]
             text_features_val = text_features_val[random_sequence]
+            token_subsample_val_idx = random_sequence
 
         logger.debug(
             f"TRAIN - img: {image_features_train.shape}, txt: {text_features_train.shape}"
@@ -630,10 +1320,107 @@ class AlignmentTrainer(Trainer):
             layer_comb_score = layer_series["alignment_score"]
             layer_comb_str = f"img_{image_layer_idx}_txt_{text_layer_idx}"
 
-            layer_image_features_train = image_features_train[:, image_layer_idx, :]
-            layer_text_features_train = text_features_train[:, text_layer_idx, :]
-            layer_image_features_val = image_features_val[:, image_layer_idx, :]
-            layer_text_features_val = text_features_val[:, text_layer_idx, :]
+            # Slice features at the chosen layer. Inputs may be:
+            #  - (N, L, D) legacy multi-layer CLS extraction
+            #  - (N, D)    derived from unified token cache (single-layer CLS)
+            #  - (N, 1)    placeholder when token_level skips the CLS pre-load
+            def _layer_slice(feats, idx):
+                if feats.ndim == 2:
+                    return feats
+                return feats[:, idx, :]
+
+            layer_image_features_train = _layer_slice(
+                image_features_train, image_layer_idx
+            )
+            layer_text_features_train = _layer_slice(
+                text_features_train, text_layer_idx
+            )
+            layer_image_features_val = _layer_slice(
+                image_features_val, image_layer_idx
+            )
+            layer_text_features_val = _layer_slice(
+                text_features_val, text_layer_idx
+            )
+
+            # Token-level override: replace the (N, D) CLS slices with
+            # (N, T, D) token features for the selected layer, plus masks.
+            token_level = bool(
+                self.config["training"].get("token_level", False)
+            )
+            layer_text_mask_train = None
+            layer_text_mask_val = None
+            if token_level:
+                token_bundle = self._load_token_features_for_layer(
+                    img_layer_idx=image_layer_idx,
+                    txt_layer_idx=text_layer_idx,
+                )
+                layer_image_features_train = token_bundle["img_train"]
+                layer_text_features_train = token_bundle["txt_train"]
+                layer_image_features_val = token_bundle["img_val"]
+                layer_text_features_val = token_bundle["txt_val"]
+                layer_text_mask_train = token_bundle["txt_mask_train"]
+                layer_text_mask_val = token_bundle["txt_mask_val"]
+
+                # Apply drop_duplicates to token features so the token
+                # path matches the CLS path's caption-image dedup
+                # (591K -> 118K for COCO). Each tensor's shape is checked
+                # independently against len(sel_*_indices) — that gates
+                # both the legacy "everything full" case and the new
+                # "image was deduped at extraction" case where the image
+                # tensor is already 118K but text / mask are still 591K.
+                def _apply_if_full(tensor, mask_full, mask_bool):
+                    if (
+                        mask_bool is not None
+                        and tensor is not None
+                        and tensor.shape[0] == mask_full
+                    ):
+                        return tensor[mask_bool]
+                    return tensor
+
+                if sel_train_indices is not None:
+                    full_train_n = len(sel_train_indices)
+                    layer_image_features_train = _apply_if_full(
+                        layer_image_features_train, full_train_n, sel_train_indices
+                    )
+                    layer_text_features_train = _apply_if_full(
+                        layer_text_features_train, full_train_n, sel_train_indices
+                    )
+                    layer_text_mask_train = _apply_if_full(
+                        layer_text_mask_train, full_train_n, sel_train_indices
+                    )
+                if sel_val_indices is not None:
+                    full_val_n = len(sel_val_indices)
+                    layer_image_features_val = _apply_if_full(
+                        layer_image_features_val, full_val_n, sel_val_indices
+                    )
+                    layer_text_features_val = _apply_if_full(
+                        layer_text_features_val, full_val_n, sel_val_indices
+                    )
+                    layer_text_mask_val = _apply_if_full(
+                        layer_text_mask_val, full_val_n, sel_val_indices
+                    )
+
+                # NOTE: in token_level mode the `_load_token_features_for_layer`
+                # helper already applies the ``n_random_subsample_*`` cap at
+                # extraction time (first-N view on the dataloader) to avoid
+                # materialising 100+ GB of full-dataset tokens. The per-tensor
+                # shape check above guards against double-application:
+                #   - subset extraction (`-n{N}` cache) shape != full df ->
+                #     dedup silently skipped (the subset is already sized)
+                #   - dedup-at-extraction image cache is already 118K and
+                #     != full 591K -> dedup silently skipped on image only,
+                #     still applied to the still-full text + mask tensors
+
+                logger.debug(
+                    f"TOKEN TRAIN - img: {tuple(layer_image_features_train.shape)}, "
+                    f"txt: {tuple(layer_text_features_train.shape)}, "
+                    f"txt_mask: {tuple(layer_text_mask_train.shape)}"
+                )
+                logger.debug(
+                    f"TOKEN VAL - img: {tuple(layer_image_features_val.shape)}, "
+                    f"txt: {tuple(layer_text_features_val.shape)}, "
+                    f"txt_mask: {tuple(layer_text_mask_val.shape)}"
+                )
 
             layer_additional_image_features = None
             if additional_image_features is not None:
@@ -727,8 +1514,11 @@ class AlignmentTrainer(Trainer):
             if self.n_random_subsample_val is not None:
                 log_dict["meta/n_random_subsample_val"] = self.n_random_subsample_val
 
-            if self.config["training"]["visualize_original_embeddings"]:
-                # visualize the original embedding space
+            if (
+                self.config["training"]["visualize_original_embeddings"]
+                and not token_level
+            ):
+                # visualize the original embedding space (2D only)
                 fig_emb_image = embedding_plot(
                     X=layer_image_features_val.float().numpy(),
                     return_figure=True,
@@ -769,10 +1559,18 @@ class AlignmentTrainer(Trainer):
                 input_dim=text_dim,
                 **self.config["training"]["alignment_layer_kwargs"],
             )
+            # Some alignment layers (e.g. FreezeAlignAlignmentLayer) need to
+            # know which modality they serve because they hold both modalities'
+            # components in a single class. Backwards compatible: layers that
+            # don't define set_modality see no change.
+            if hasattr(alignment_image, "set_modality"):
+                alignment_image.set_modality("image")
+            if hasattr(alignment_text, "set_modality"):
+                alignment_text.set_modality("text")
             if self.config["training"]["wandb_watch"]:
                 wandb.watch(models=[alignment_image, alignment_text], log="all")
 
-            if self.print_model_summary:
+            if self.print_model_summary and not token_level:
                 print("*" * 20 + " Alignment Image " + "*" * 20)
                 input_size = (self.train_batch_size,)
                 summary(
@@ -785,6 +1583,16 @@ class AlignmentTrainer(Trainer):
                     alignment_text,
                     input_size=input_size + (text_dim,),
                     col_names=["input_size", "output_size", "num_params", "trainable"],
+                )
+            elif self.print_model_summary and token_level:
+                # torchinfo.summary with mask kwarg is awkward; just print parameter counts
+                n_img = sum(p.numel() for p in alignment_image.parameters())
+                n_txt = sum(p.numel() for p in alignment_text.parameters())
+                print(
+                    f"[token_level] alignment_image params={n_img}, "
+                    f"alignment_text params={n_txt}, "
+                    f"img_tokens={tuple(layer_image_features_train.shape)}, "
+                    f"txt_tokens={tuple(layer_text_features_train.shape)}"
                 )
 
             optimizer_cls = get_optimizer_type(
@@ -799,6 +1607,7 @@ class AlignmentTrainer(Trainer):
                     alignment_text=alignment_text,
                     optimizer_cls=optimizer_cls,
                     wandb_prefix=f"{layer_comb_str}/",
+                    text_mask_train=layer_text_mask_train,
                     **self.config["training"]["lr_finder"],
                 )
                 logger.debug(f"LR finder complete. Using learning rate: {optimal_lr}")
@@ -869,6 +1678,7 @@ class AlignmentTrainer(Trainer):
                     additional_image_features=layer_additional_image_features,
                     additional_text_features=layer_additional_text_features,
                     wandb_prefix=f"{layer_comb_str}/",
+                    text_mask=layer_text_mask_train,
                 )
                 train_step += steps
 
@@ -881,6 +1691,7 @@ class AlignmentTrainer(Trainer):
                         alignment_image=alignment_image,
                         alignment_text=alignment_text,
                         wandb_prefix=f"{layer_comb_str}/",
+                        text_mask=layer_text_mask_val,
                     )
                 pbar.set_description(
                     f"Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}"
@@ -973,6 +1784,8 @@ class AlignmentTrainer(Trainer):
         additional_image_features: Optional[torch.Tensor] = None,
         additional_text_features: Optional[torch.Tensor] = None,
         wandb_prefix: str = "",
+        text_mask: Optional[torch.Tensor] = None,
+        image_cls_attn: Optional[torch.Tensor] = None,
     ):
         num_samples = image_features.shape[0]
 
@@ -980,6 +1793,10 @@ class AlignmentTrainer(Trainer):
         random_sequence = torch.randperm(num_samples)
         image_features = image_features[random_sequence]
         text_features = text_features[random_sequence]
+        if text_mask is not None:
+            text_mask = text_mask[random_sequence]
+        if image_cls_attn is not None:
+            image_cls_attn = image_cls_attn[random_sequence]
 
         # NOTE: ablation from reviewers (fixed set for R_S)
         random_sequence_fixed = torch.randperm(num_samples)[: self.train_batch_size]
@@ -1050,8 +1867,25 @@ class AlignmentTrainer(Trainer):
             optimizer.zero_grad()
 
             # forward pass through alignment layers
-            aligned_image_feats = alignment_image(image_feats)
-            aligned_text_feats = alignment_text(text_feats)
+            # Conditionally pass cls_attn prior: only when the layer opts
+            # in via `cls_attn_prior=True` AND we actually have a tensor
+            # for this batch. Keeps non-token layers (Linear, MLP, etc.)
+            # unaffected — they never see the kwarg.
+            if (
+                image_cls_attn is not None
+                and getattr(alignment_image, "cls_attn_prior", False)
+            ):
+                img_cls_attn_batch = image_cls_attn[i:end_i].to(self.device)
+                aligned_image_feats = alignment_image(
+                    image_feats, cls_attn=img_cls_attn_batch
+                )
+            else:
+                aligned_image_feats = alignment_image(image_feats)
+            if text_mask is not None:
+                text_mask_batch = text_mask[i:end_i].to(self.device)
+                aligned_text_feats = alignment_text(text_feats, mask=text_mask_batch)
+            else:
+                aligned_text_feats = alignment_text(text_feats)
 
             # additional unimodal data
             loss_kwargs = {}
@@ -1218,6 +2052,8 @@ class AlignmentTrainer(Trainer):
         alignment_image: torch.nn.Module,
         alignment_text: torch.nn.Module,
         wandb_prefix: str = "",
+        text_mask: Optional[torch.Tensor] = None,
+        image_cls_attn: Optional[torch.Tensor] = None,
     ):
         num_samples = image_features.shape[0]
 
@@ -1234,8 +2070,28 @@ class AlignmentTrainer(Trainer):
             image_feats = image_feats.float().cuda()
             text_feats = text_feats.float().cuda()
 
-            aligned_image_feats = alignment_image(image_feats)
-            aligned_text_feats = alignment_text(text_feats)
+            # Conditionally pass cls_attn prior — see train() for why.
+            if (
+                image_cls_attn is not None
+                and getattr(alignment_image, "cls_attn_prior", False)
+            ):
+                img_cls_attn_batch = image_cls_attn[
+                    i : i + self.train_batch_size
+                ].to(self.device)
+                aligned_image_feats = alignment_image(
+                    image_feats, cls_attn=img_cls_attn_batch
+                )
+            else:
+                aligned_image_feats = alignment_image(image_feats)
+            if text_mask is not None:
+                text_mask_batch = text_mask[i : i + self.train_batch_size].to(
+                    self.device
+                )
+                aligned_text_feats = alignment_text(
+                    text_feats, mask=text_mask_batch
+                )
+            else:
+                aligned_text_feats = alignment_text(text_feats)
 
             # backward pass with clip loss
             loss_dict = self.loss(
@@ -1372,18 +2228,40 @@ class AlignmentTrainer(Trainer):
 
         vision_model, image_transform = self.get_lvm(lvm_model_name=self.lvm_model_name)
         language_model, tokenizer = self.get_llm(llm_model_name=self.llm_model_name)
+
+        # Token-level zero-shot is opt-in and only meaningful when the
+        # alignment layers are token-aware (i.e. training.token_level=true).
+        token_level_zero_shot = bool(
+            self.config["evaluation"].get("token_level_zero_shot", False)
+        ) and bool(self.config["training"].get("token_level", False))
+
         for eval_dataset_name, e_dataset in self.eval_zero_shot_datasets:
             set_transform_dataset(
                 dataset=e_dataset,
                 image_transform=image_transform,
             )
 
-            save_path_vision = AlignmentTrainer.get_feature_save_path(
-                m_name=self.lvm_model_name,
-                d_name=eval_dataset_name,
-                save_path=self.save_path,
-                suffix=f"eval-{self.config['features']['pool_img']}",
+            _img_size_cfg = self.config["features"].get("img_size")
+            _res_tag = (
+                f"-r{int(_img_size_cfg)}" if _img_size_cfg is not None else ""
             )
+            if token_level_zero_shot:
+                # Token-mode image cache: (N, T, D) at the selected layer.
+                save_path_vision = AlignmentTrainer.get_feature_save_path(
+                    m_name=self.lvm_model_name,
+                    d_name=eval_dataset_name,
+                    save_path=self.save_path,
+                    suffix=(
+                        f"eval-none_layer-{int(image_layer_idx)}{_res_tag}-zs"
+                    ),
+                )
+            else:
+                save_path_vision = AlignmentTrainer.get_feature_save_path(
+                    m_name=self.lvm_model_name,
+                    d_name=eval_dataset_name,
+                    save_path=self.save_path,
+                    suffix=f"eval-{self.config['features']['pool_img']}{_res_tag}",
+                )
             save_path_language = AlignmentTrainer.get_feature_save_path(
                 m_name=self.llm_model_name,
                 d_name=eval_dataset_name,
@@ -1413,6 +2291,7 @@ class AlignmentTrainer(Trainer):
                 sample_by_sample_embedding=self.config["evaluation"][
                     "sample_by_sample_embedding"
                 ],
+                token_level=token_level_zero_shot,
             )
             # we move it to the cpu since in the loop we move chunks back
             # (used to optimize memory for big models)
@@ -1520,7 +2399,14 @@ class AlignmentTrainer(Trainer):
 
                     images = images.to(self.device, non_blocking=True)
                     lvm_output = vision_model(images)
-                    if self.config["features"]["pool_img"] == "cls":
+                    if token_level_zero_shot:
+                        # Token-mode: keep the full token sequence for the
+                        # selected layer instead of CLS-slicing all layers.
+                        # vision_model is a feature_extractor whose dict
+                        # values are layer outputs in block order.
+                        layer_outputs = list(lvm_output.values())
+                        lvm_output = layer_outputs[image_layer_idx]  # (B, T, D)
+                    elif self.config["features"]["pool_img"] == "cls":
                         # extract the class token for all layers
                         lvm_output = [v[:, 0, :] for v in lvm_output.values()]
                         lvm_output = torch.stack(lvm_output).permute(1, 0, 2)
@@ -1530,17 +2416,23 @@ class AlignmentTrainer(Trainer):
                         )
                     lvm_feats.append(lvm_output.cpu())
 
-                # lvm_output = (batch_size, dim)
-                lvm_output = lvm_output[:, image_layer_idx, :].float()
-                l_original_image_feats.append(lvm_output.cpu())
+                if token_level_zero_shot:
+                    # cached path returns the layer-pinned (B, T, D) tensor
+                    # already; on-the-fly path produced the same shape above.
+                    image_feats = lvm_output.float()
+                else:
+                    # legacy CLS path: cached returns (B, L, D), on-the-fly
+                    # returns (B, L, D); slice the layer.
+                    image_feats = lvm_output[:, image_layer_idx, :].float()
+                l_original_image_feats.append(image_feats.cpu())
 
-                lvm_output = alignment_image(lvm_output)
-                lvm_output = safe_normalize(lvm_output, p=2, dim=-1)
-                l_aligned_image_feats.append(lvm_output.cpu())
+                aligned = alignment_image(image_feats)
+                aligned = safe_normalize(aligned, p=2, dim=-1)
+                l_aligned_image_feats.append(aligned.cpu())
 
                 # compute the logits by measuring the similarity
                 logits = 100.0 * chunked_logits(
-                    lvm_output,
+                    aligned,
                     zero_shot_classifier,
                     device=self.device,
                 )
@@ -1672,6 +2564,10 @@ class AlignmentTrainer(Trainer):
         alignment_image = alignment_image.to(self.device)
         alignment_text = alignment_text.to(self.device)
 
+        token_level_retrieval = bool(
+            self.config["training"].get("token_level", False)
+        )
+
         for eval_dataset_name, e_dataset in self.eval_retrieval_datasets:
             eval_loader = DataLoader(
                 e_dataset,
@@ -1681,16 +2577,32 @@ class AlignmentTrainer(Trainer):
                 shuffle=False,
                 pin_memory=False,
             )
-            image_features_val = self.get_image_features(
-                loader=eval_loader,
-                lvm_model_name=self.lvm_model_name,
-                suffix=f"eval-{self.config['features']['pool_img']}",
-            )
-            text_features_val = self.get_text_features(
-                loader=eval_loader,
-                llm_model_name=self.llm_model_name,
-                suffix=f"eval-{self.config['features']['pool_txt']}",
-            )
+            eval_text_mask = None
+            if token_level_retrieval:
+                (
+                    image_features_val,
+                    text_features_val,
+                    eval_text_mask,
+                ) = self._load_eval_token_features(
+                    eval_loader=eval_loader,
+                    img_layer_idx=image_layer_idx,
+                    txt_layer_idx=text_layer_idx,
+                )
+            else:
+                _img_size_cfg = self.config["features"].get("img_size")
+                _res_tag = (
+                    f"-r{int(_img_size_cfg)}" if _img_size_cfg is not None else ""
+                )
+                image_features_val = self.get_image_features(
+                    loader=eval_loader,
+                    lvm_model_name=self.lvm_model_name,
+                    suffix=f"eval-{self.config['features']['pool_img']}{_res_tag}",
+                )
+                text_features_val = self.get_text_features(
+                    loader=eval_loader,
+                    llm_model_name=self.llm_model_name,
+                    suffix=f"eval-{self.config['features']['pool_txt']}",
+                )
             num_samples = image_features_val.shape[0]
 
             # drop duplicates for fair comparison
@@ -1713,17 +2625,32 @@ class AlignmentTrainer(Trainer):
                 desc=eval_dataset_name,
                 file=sys.stdout,
             ):
-                image_feats = image_features_val[
-                    i : i + self.eval_batch_size, image_layer_idx
-                ]
-                text_feats = text_features_val[
-                    i : i + self.eval_batch_size, text_layer_idx
-                ]
+                if token_level_retrieval:
+                    # pool=none features are single-layer (N, T, D)
+                    image_feats = image_features_val[i : i + self.eval_batch_size]
+                    text_feats = text_features_val[i : i + self.eval_batch_size]
+                else:
+                    image_feats = image_features_val[
+                        i : i + self.eval_batch_size, image_layer_idx
+                    ]
+                    text_feats = text_features_val[
+                        i : i + self.eval_batch_size, text_layer_idx
+                    ]
                 image_feats = image_feats.float().to(self.device)
                 text_feats = text_feats.float().to(self.device)
 
-                image_feats = alignment_image(image_feats)
-                text_feats = alignment_text(text_feats)
+                if token_level_retrieval:
+                    image_feats = alignment_image(image_feats)
+                    if eval_text_mask is not None:
+                        batch_mask = eval_text_mask[
+                            i : i + self.eval_batch_size
+                        ].to(self.device)
+                        text_feats = alignment_text(text_feats, mask=batch_mask)
+                    else:
+                        text_feats = alignment_text(text_feats)
+                else:
+                    image_feats = alignment_image(image_feats)
+                    text_feats = alignment_text(text_feats)
 
                 aligned_image_feats.append(image_feats)
                 aligned_text_feats.append(text_feats)

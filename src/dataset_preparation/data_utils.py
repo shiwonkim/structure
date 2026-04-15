@@ -218,7 +218,7 @@ def get_datasets(dataset, transform, root_dir: Union[str, Path] = "./data", **kw
         )
 
     elif dataset == "flickr30":
-        flickr_path = os.path.join(data_path, "flickr30k_images")
+        flickr_path = os.path.join(data_path, "flickr30k")
         train_dataset = Flickr30kDataset(
             root_dir=flickr_path,
             meta_path=os.path.join(flickr_path, "results.csv"),

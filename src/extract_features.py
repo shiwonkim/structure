@@ -159,12 +159,24 @@ def extract_lvm_features(filenames, dataset, args):
             print("file exists. skipping")
             continue
 
-        vision_model = timm.create_model(lvm_model_name, pretrained=True).cuda().eval()
+        model_kwargs = {}
+        img_size = getattr(args, "img_size", None)
+        if img_size is not None:
+            model_kwargs["img_size"] = int(img_size)
+        vision_model = (
+            timm.create_model(lvm_model_name, pretrained=True, **model_kwargs)
+            .cuda()
+            .eval()
+        )
         lvm_param_count = sum([p.numel() for p in vision_model.parameters()])
 
-        transform = create_transform(
-            **resolve_data_config(vision_model.pretrained_cfg, model=vision_model)
+        data_config = resolve_data_config(
+            vision_model.pretrained_cfg, model=vision_model
         )
+        if img_size is not None:
+            data_config["input_size"] = (3, int(img_size), int(img_size))
+            data_config["crop_pct"] = 1.0
+        transform = create_transform(**data_config)
 
         if "vit" in lvm_model_name:
             return_nodes = [
@@ -242,6 +254,13 @@ if __name__ == "__main__":
     parser.add_argument("--modelset", type=str, default="val", choices=["val", "test"])
     parser.add_argument(
         "--modality", type=str, default="all", choices=["vision", "language", "all"]
+    )
+    parser.add_argument(
+        "--img_size",
+        type=int,
+        default=None,
+        help="Override input image resolution (e.g. 224 for DINOv2 ViT-S/14 to "
+        "produce 256 patches + 1 CLS = 257 tokens).",
     )
     parser.add_argument("--output_dir", type=str, default="./results/features")
     parser.add_argument("--qlora", action="store_true")

@@ -1,0 +1,74 @@
+defaults: !include default.yaml
+
+overrides:
+    features:
+        dataset: "cifar10"
+        num_workers: 2
+        batch_size: 64
+
+    alignment:
+        llm_model_name: "sentence-transformers/all-MiniLM-L6-v2"
+        lvm_model_name: "vit_small_patch14_dinov2.lvd142m"
+
+    layer_selection:
+        type: "random"
+        n_samples: 500
+        metric: "mutual_knn"
+        metric_kwargs:
+            topk: "rice"
+            normalize: true
+        n_score_bins: 5
+        best_only: true
+        last_only: false
+        n_last_layers: null
+
+    training:
+        token_level: true
+
+        n_epochs: 2
+        batch_size: 256
+        use_lr_finder: false
+        early_stopping: false
+        early_stopping_patience: 5
+        clip_grad: 1.0
+        drop_duplicates: false
+        wandb_watch: false
+        visualize_original_embeddings: false
+        log_structural_preservation: false
+        embedding_visualization: 9999
+
+        n_random_subsample_train: 2000
+        n_random_subsample_val: 1000
+
+        alignment_layer_name: "FreezeAlignAlignmentLayer"
+        alignment_layer_kwargs:
+            embed_dim: 384
+            dropout: 0.1
+
+        clip_loss_name: "CLIPLoss"
+        clip_loss:
+            temperature: 0.05
+            normalize_latents: true
+            warmup_steps: 10
+            structure_lambda: 0
+            structure_levels: 1
+            structure_margin: 0.0
+            structure_weighting: "none"
+
+        scheduler_name: "CosineAnnealingLR"
+        scheduler_kwargs: {}
+        scheduler_epoch_cycles: 2
+
+    evaluation:
+        batch_size: 64
+        num_workers: 2
+        num_classes_per_batch: 2
+        plot_embedding_space: false
+        log_structural_preservation: false
+        # FreezeAlign trains text_proj on local_text_proj outputs (post
+        # LN + PatchProjection), so feeding raw CLS through text_proj at
+        # eval is out-of-distribution. Always use the token CAP eval path.
+        token_level_zero_shot: true
+        zero_shot_datasets:
+            - "cifar10"
+        retrieval_datasets: []
