@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import timm
 import torch
+import torch.nn.functional as F
 import torchmetrics
 import wandb
 from deepspeed.runtime.lr_schedules import WarmupDecayLR, WarmupLR
@@ -801,6 +802,180 @@ class AlignmentTrainer(Trainer):
             "txt_mask_val": txt_mask_val,
         }
 
+    def get_image_cls_attention(
+        self,
+        loader,
+        lvm_model_name: str,
+        suffix: str,
+        layer_idx: int,
+        allow_image_dedup: bool = True,
+    ) -> torch.Tensor:
+        """Extract per-image CLS→patch attention from the last block's attn.
+
+        Returns a ``(N, P)`` float16 tensor where ``N`` is the number of
+        unique images (with dedup) and ``P`` is the patch count. The
+        attention is averaged over heads and renormalized so each row sums
+        to 1.0. Cached to disk at
+        ``results/features/<model>-<dataset>-<suffix>_cls_attn_layer-<L>-r<img_size>.npy``
+        so subsequent runs skip the forward pass.
+
+        Mirrors ``get_image_features`` conventions: same dedup gate, same
+        save-path format, same sidecar shape expectations. The cache
+        file is compatible with the ``pool=none`` image token cache,
+        i.e. the N-axes line up with the dedup'd (118K for COCO) layout.
+        """
+        if hasattr(loader.dataset, "name"):
+            dataset_name = loader.dataset.name
+        else:
+            dataset_name = type(loader.dataset).__name__
+
+        img_size = self.config["features"].get("img_size")
+        res_tag = f"-r{int(img_size)}" if img_size is not None else ""
+        full_suffix = f"{suffix}_cls_attn_layer-{int(layer_idx)}{res_tag}"
+        save_path = AlignmentTrainer.get_feature_save_path(
+            m_name=lvm_model_name,
+            d_name=dataset_name,
+            save_path=self.save_path,
+            suffix=full_suffix,
+        )
+        if save_path.exists():
+            cached = torch.load(save_path, weights_only=False)["features"]
+            logger.debug(f"Loaded CLS attention from: {save_path}")
+            return cached
+
+        # Build a fresh unwrapped timm model — the feature-extractor wrapper
+        # obscures the attention module's input, so a separate forward is
+        # easier than patching the GraphModule. This is a single one-off
+        # pass, amortised by the on-disk cache.
+        model_kwargs = {"img_size": int(img_size)} if img_size is not None else {}
+        timm_model = timm.create_model(
+            lvm_model_name, pretrained=True, **model_kwargs
+        )
+        data_config = resolve_data_config(
+            timm_model.pretrained_cfg, model=timm_model
+        )
+        if img_size is not None:
+            data_config["input_size"] = (3, int(img_size), int(img_size))
+            data_config["crop_pct"] = 1.0
+        timm_transform = create_transform(**data_config)
+        timm_transform.transforms = [_ensure_rgb_image] + timm_transform.transforms
+        set_transform_dataset(
+            dataset=loader.dataset,
+            image_transform=timm_transform,
+        )
+        timm_model = timm_model.to(self.device).eval()
+
+        # Apply dedup at extraction, same gate as the image token path,
+        # so the N-axes line up between the token cache and the cls-attn
+        # cache. One row per unique image_path.
+        is_deduped = False
+        if (
+            allow_image_dedup
+            and self._should_dedup_image_extraction(loader)
+        ):
+            df = loader.dataset.df
+            first_idx_mask = (df.groupby("image_path").cumcount() == 0).values
+            keep_indices = np.where(first_idx_mask)[0].tolist()
+            n_unique = len(keep_indices)
+            n_full = len(df)
+            logger.info(
+                f"CLS attn dedup: {n_full:,} rows -> {n_unique:,} unique "
+                f"images (same dedup as token cache)"
+            )
+            unique_view = self._indexed_dataset_view(loader.dataset, keep_indices)
+            from torch.utils.data import DataLoader as _DataLoader
+            iter_loader = _DataLoader(
+                unique_view,
+                batch_size=loader.batch_size,
+                shuffle=False,
+                num_workers=getattr(loader, "num_workers", 0),
+                pin_memory=False,
+                drop_last=False,
+                collate_fn=getattr(loader, "collate_fn", None),
+            )
+            iter_total_n = n_unique
+            is_deduped = True
+            unique_paths = df.loc[first_idx_mask, "image_path"].reset_index(drop=True)
+            path_to_pos = {p: i for i, p in enumerate(unique_paths)}
+            unique_to_full_idx = torch.tensor(
+                df["image_path"].map(path_to_pos).values, dtype=torch.long
+            )
+        else:
+            iter_loader = loader
+            iter_total_n = len(loader.dataset)
+            unique_to_full_idx = None
+
+        # Pre-allocate (N, P) float16 storage, filled by offset. Patch count
+        # P is derived from the first batch's hooked input size.
+        cls_attn_buf: Optional[torch.Tensor] = None
+        offset = 0
+
+        # Forward pre-hook on the last block's attention module captures
+        # its (already-LN'd) input. After the main forward we recompute q/k
+        # manually from that input and derive the CLS→patches attention.
+        captured_input: Dict[str, torch.Tensor] = {}
+
+        def _pre_hook(module, inputs):
+            captured_input["x"] = inputs[0]
+
+        last_attn = timm_model.blocks[int(layer_idx)].attn
+        handle = last_attn.register_forward_pre_hook(_pre_hook)
+
+        try:
+            for batch in tqdm(
+                iter_loader, total=len(iter_loader), file=sys.stdout,
+                desc="CLS attention",
+            ):
+                images, _ = batch
+                with torch.no_grad():
+                    images = images.to(self.device, non_blocking=True)
+                    _ = timm_model(images)
+
+                    x = captured_input["x"]        # (B, N, C) LN'd input
+                    B, N, C = x.shape
+                    num_heads = last_attn.num_heads
+                    head_dim = C // num_heads
+                    qkv = last_attn.qkv(x).reshape(B, N, 3, num_heads, head_dim)
+                    q, k, _v = torch.unbind(qkv, dim=2)
+                    q = q.transpose(1, 2)          # (B, H, N, D_h)
+                    k = k.transpose(1, 2)
+                    scale = head_dim ** -0.5
+                    attn_weights = (q @ k.transpose(-2, -1)) * scale
+                    attn_weights = F.softmax(attn_weights, dim=-1)
+                    # CLS (index 0) → patches (index 1:)
+                    cls_to_patches = attn_weights[:, :, 0, 1:]  # (B, H, P)
+                    cls_attn = cls_to_patches.mean(dim=1)        # (B, P)
+                    cls_attn = cls_attn / cls_attn.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+                    cls_attn_cpu = cls_attn.to(dtype=torch.float16).cpu()
+                    if cls_attn_buf is None:
+                        P = cls_attn_cpu.shape[1]
+                        cls_attn_buf = torch.empty(
+                            (iter_total_n, P), dtype=torch.float16
+                        )
+                    bs = cls_attn_cpu.shape[0]
+                    cls_attn_buf[offset : offset + bs] = cls_attn_cpu
+                    offset += bs
+        finally:
+            handle.remove()
+            del timm_model
+            torch.cuda.empty_cache()
+
+        if offset < iter_total_n:
+            cls_attn_buf = cls_attn_buf[:offset]
+
+        save_dict = {"features": cls_attn_buf}
+        if is_deduped and unique_to_full_idx is not None:
+            save_dict["unique_to_full_idx"] = unique_to_full_idx
+            save_dict["is_deduped_extraction"] = True
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(save_dict, save_path)
+        logger.info(
+            f"Saved CLS attention cache: {save_path} "
+            f"shape={tuple(cls_attn_buf.shape)} dtype={cls_attn_buf.dtype}"
+        )
+        return cls_attn_buf
+
     def _load_or_build_text_mask(
         self, loader, llm_model_name: str, suffix: str
     ) -> torch.Tensor:
@@ -1422,6 +1597,81 @@ class AlignmentTrainer(Trainer):
                     f"txt_mask: {tuple(layer_text_mask_val.shape)}"
                 )
 
+            # CLS-attention prior: load per-image CLS→patch attention from
+            # the last DINOv2 block if the configured alignment layer has
+            # cls_attn_prior=True. Cache is extracted on demand and shares
+            # the N-axis with the image token cache (same dedup).
+            image_cls_attn_train = None
+            image_cls_attn_val = None
+            if token_level:
+                akw = self.config["training"].get("alignment_layer_kwargs", {})
+                if akw.get("cls_attn_prior", False):
+                    # Extraction layer for the CLS attention — use the
+                    # same layer as the token features (selected layer).
+                    # Reuse the subsampled loaders from the token loader
+                    # helper to keep the N-axis aligned with the img cache.
+                    max_train_cap = self.config["training"].get(
+                        "n_random_subsample_train"
+                    )
+                    max_val_cap = self.config["training"].get(
+                        "n_random_subsample_val"
+                    )
+                    train_loader_cls = self._subsampled_loader(
+                        self.train_dataset, max_train_cap
+                    )
+                    val_loader_cls = self._subsampled_loader(
+                        self.val_dataset, max_val_cap
+                    )
+                    train_tag = (
+                        f"-n{max_train_cap}" if max_train_cap is not None else ""
+                    )
+                    val_tag = (
+                        f"-n{max_val_cap}" if max_val_cap is not None else ""
+                    )
+                    try:
+                        image_cls_attn_train = self.get_image_cls_attention(
+                            loader=train_loader_cls,
+                            lvm_model_name=self.lvm_model_name,
+                            suffix=f"train{train_tag}",
+                            layer_idx=int(image_layer_idx),
+                        )
+                        image_cls_attn_val = self.get_image_cls_attention(
+                            loader=val_loader_cls,
+                            lvm_model_name=self.lvm_model_name,
+                            suffix=f"val{val_tag}",
+                            layer_idx=int(image_layer_idx),
+                        )
+                        logger.info(
+                            f"CLS attention loaded: "
+                            f"train {tuple(image_cls_attn_train.shape)}, "
+                            f"val {tuple(image_cls_attn_val.shape)}"
+                        )
+
+                        # Dedup application — same _apply_if_full logic as
+                        # the image token tensor. image_cls_attn is already
+                        # dedup'd if the image cache is; if sel_*_indices
+                        # is full-length (i.e. image tensor is still full),
+                        # apply the boolean mask to image_cls_attn too.
+                        if sel_train_indices is not None:
+                            image_cls_attn_train = _apply_if_full(
+                                image_cls_attn_train,
+                                len(sel_train_indices),
+                                sel_train_indices,
+                            )
+                        if sel_val_indices is not None:
+                            image_cls_attn_val = _apply_if_full(
+                                image_cls_attn_val,
+                                len(sel_val_indices),
+                                sel_val_indices,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"CLS attention extraction failed: {type(e).__name__}: "
+                            f"{e}. Falling back to standard CAP (cls_attn=None)."
+                        )
+                        image_cls_attn_train = None
+                        image_cls_attn_val = None
+
             layer_additional_image_features = None
             if additional_image_features is not None:
                 layer_additional_image_features = additional_image_features[
@@ -1679,6 +1929,7 @@ class AlignmentTrainer(Trainer):
                     additional_text_features=layer_additional_text_features,
                     wandb_prefix=f"{layer_comb_str}/",
                     text_mask=layer_text_mask_train,
+                    image_cls_attn=image_cls_attn_train,
                 )
                 train_step += steps
 
@@ -1692,6 +1943,7 @@ class AlignmentTrainer(Trainer):
                         alignment_text=alignment_text,
                         wandb_prefix=f"{layer_comb_str}/",
                         text_mask=layer_text_mask_val,
+                        image_cls_attn=image_cls_attn_val,
                     )
                 pbar.set_description(
                     f"Train loss: {train_loss:.4f}, Val loss: {val_loss:.4f}"

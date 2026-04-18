@@ -19,6 +19,71 @@
 
 ---
 
+## 2026-04-15 — CLS attention prior: extraction + training
+
+Activated the dormant CLS attention prior on `BridgeAnchorTokenAlignmentLayer`. The layer already supported a learnable per-anchor β that biases the CAP softmax logits by `β_k * log(cls_attn + ε)`, and the trainer already accepted `image_cls_attn` kwargs in `train()` / `validate()` — but the extraction and pass-through were never wired. This entry closes those gaps.
+
+**1. Extractor — `AlignmentTrainer.get_image_cls_attention`**
+
+Added a new method on the trainer that extracts per-image CLS→patch attention from the last DINOv2 block. Because STRUCTURE's vision path uses a `torchvision.models.feature_extraction.create_feature_extractor`-wrapped model that obscures module inputs, the extractor loads a fresh unwrapped timm model, registers a forward-pre-hook on `blocks[layer_idx].attn` to capture the (LN'd) input, then manually recomputes Q/K from `attn.qkv` and derives the attention matrix:
+
+```python
+qkv = attn.qkv(x).reshape(B, N, 3, H, D_h)
+q, k, _ = torch.unbind(qkv, dim=2)
+q, k = q.transpose(1,2), k.transpose(1,2)
+attn_weights = F.softmax((q @ k.transpose(-2,-1)) * scale, dim=-1)
+cls_attn = attn_weights[:, :, 0, 1:].mean(dim=1)   # average over heads
+cls_attn = cls_attn / cls_attn.sum(-1, keepdim=True).clamp(min=1e-8)
+```
+
+Mirrors the bridge-anchors reference at `src/data/extract_attention_maps.py:103` exactly. Shares the image-side dedup gate with `get_image_features(pool=none)` so the N-axis of the CLS attention cache lines up with the token cache (dedup'd 82K for COCO train on ViT-S). Output is `(N, P)` float16 saved at `results/features/<model>-<dataset>-<split>_cls_attn_layer-<L>-r<img_size>.npy`.
+
+**2. Trainer wiring**
+
+`fit()` now conditionally loads the CLS attention cache when `token_level=True` *and* `alignment_layer_kwargs.cls_attn_prior=True`:
+
+- Uses `_subsampled_loader` with the same subset caps as the token-feature path so the dry-run path stays consistent.
+- Applies the same `_apply_if_full` dedup as the image token tensor — handles both "image already dedup'd at extraction" (118K) and "everything full" (591K) shapes.
+- Wrapped in try/except: if extraction fails, logs a warning and falls back to standard CAP (`cls_attn=None`) rather than crashing the run.
+
+Then threaded `image_cls_attn=image_cls_attn_train/val` into the existing `self.train(...)` and `self.validate(...)` call sites, which already had the kwarg and the conditional "only apply if `layer.cls_attn_prior` is True" logic from the Apr 14 plumbing work.
+
+**3. Configs — 3 new files**
+
+Copied the existing Token BA configs into `_prior` variants:
+
+- `configs/ba/vits_minilm/token_k128_prior.yaml`
+- `configs/ba/vits_minilm/token_k256_prior.yaml`
+- `configs/ba/vits_minilm/token_k512_prior.yaml`
+
+Each adds two fields under `alignment_layer_kwargs`:
+```yaml
+cls_attn_prior: true
+cls_attn_beta_init: 1.0
+```
+Everything else (pool_temperature, batch_size, retrieval datasets, etc.) inherited from the base token configs.
+
+**4. Script — `scripts/vits_minilm/04_train_ba_prior.sh`**
+
+Follows the `02_train_ba.sh` convention: sources `common.env` + `config.env`, takes GPU id as `$1`, writes timestamped log, runs the three prior configs sequentially. Doesn't abort on individual failures (so one OOM doesn't sink the whole overnight batch).
+
+**5. Launch**
+
+`bash scripts/vits_minilm/04_train_ba_prior.sh 1` — launched on GPU 1 at 19:18 KST while GPU 0 continues training `fa_d512_struct`.
+
+**Pending results** (will report when complete):
+- CLS attention extraction time and cache shape
+- Per-anchor β values after training (expect non-trivial variance across the K anchors — some push toward CLS attention, some ignore it)
+- Comparison: Token BA vs Token BA + prior at K=128/256/512
+
+**Files touched.**
+
+- `src/trainers/alignment_trainer.py` — added `torch.nn.functional as F` import; added `get_image_cls_attention` method; wired load + pass-through in `fit()` around the token-level branch.
+- `configs/ba/vits_minilm/token_k{128,256,512}_prior.yaml` — 3 new configs.
+- `scripts/vits_minilm/04_train_ba_prior.sh` — new script.
+
+---
+
 ## 2026-04-15 — Pre-Server-B cleanup + Batch 2 launch on COCO 2014
 
 Final preparation day before the Server B rsync. Migrated to real COCO 2014, rebuilt the experiment harness (configs + scripts + docs) around a method-by-encoder layout, shook out a FreezeAlign architectural bug and a CSA `sim_dim` rank-cap bug, then launched the full 14-run Batch 2 overnight on Server A. 10/14 runs have finished as of this writing.

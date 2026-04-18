@@ -1,0 +1,171 @@
+defaults:
+  alignment:
+    llm_model_name: sentence-transformers/all-roberta-large-v1
+    lvm_model_name: vit_large_patch14_dinov2.lvd142m
+  evaluation:
+    batch_size: 256
+    drop_duplicates: false
+    log_structural_preservation: false
+    num_classes_per_batch: 2
+    num_workers: 8
+    plot_embedding_space: false
+    retrieval_datasets:
+    - flickr30
+    - coco
+    sample_by_sample_embedding: false
+    structural_preservation_k:
+    - 100
+    - 1000
+    token_level_zero_shot: false
+    use_extended_prompts: true
+    zero_shot_datasets:
+    - stl10
+    - caltech101
+    - food101
+    - cifar10
+    - cifar100
+    - imagenet
+    - ucf101
+    - kinetics700
+    - sun397
+    - eurosat
+    - resisc45
+    - mnist
+    - dtd
+    - gtsrb
+    - hatefulmemes
+    - sst
+    - kitti
+    - country211
+    - fer2013
+    - clevr
+    - pcam
+    - birdsnap
+    - cars
+    - aircraft
+    - pets
+    - flowers
+  features:
+    batch_size: 16
+    dataset: coco
+    image_dedup_extraction: true
+    img_size: 224
+    label_templates:
+    - a photo of a {label}
+    modality: all
+    modelset: val
+    num_workers: 8
+    pool_img: cls
+    pool_txt: avg
+    precompute_captions: true
+    template_key: label
+  layer_selection:
+    best_only: true
+    last_only: false
+    metric: mutual_knn
+    metric_kwargs:
+      normalize: true
+      topk: rice
+    n_last_layers: null
+    n_samples: 5000
+    n_score_bins: 5
+    type: random
+  paths:
+    data_path: ./data
+    save_path: ./results
+  random_state: 42
+  training:
+    alignment_layer_kwargs:
+      dim_alignment: 256
+    alignment_layer_name: LinearAlignmentLayer
+    batch_size: 4096
+    clip_grad: 1.0
+    clip_loss:
+      normalize_latents: true
+      structure_lambda: 10.0
+      structure_levels: 1
+      structure_margin: 0.0
+      structure_weighting: none
+      temperature: 0.05
+      warmup_steps: 1000
+    clip_loss_name: CLIPLoss
+    drop_duplicates: true
+    early_stopping: true
+    early_stopping_patience: 200
+    embedding_visualization: 500
+    fixed_structure: false
+    learning_rate: 0.001
+    log_structural_preservation: false
+    lr_finder:
+      end_lr: 10
+      num_iter: 100
+      start_lr: 1.0e-07
+    mixup_alpha: 0.0
+    n_dup_samples: 1
+    n_epochs: 1000
+    optimizer_kwargs:
+      betas:
+      - 0.9
+      - 0.95
+      weight_decay: 0.0001
+    optimizer_name: AdamW
+    scheduler_epoch_cycles: 50
+    scheduler_kwargs:
+      warmup_max_lr: 0.001
+      warmup_min_lr: 0.0
+      warmup_num_steps: 10000
+    scheduler_name: CosineAnnealingLR
+    structural_preservation_k:
+    - 100
+    - 1000
+    unimodal_data:
+      image:
+      - stl10
+      text:
+      - flickr30
+      use: false
+    use_lr_finder: true
+    visualize_original_embeddings: false
+    wandb_watch: false
+overrides:
+  alignment:
+    llm_model_name: sentence-transformers/all-MiniLM-L6-v2
+    lvm_model_name: vit_small_patch14_dinov2.lvd142m
+  evaluation:
+    retrieval_datasets:
+    - flickr30
+    - coco
+    token_level_zero_shot: false
+    zero_shot_datasets:
+    - cifar10
+    - stl10
+    - cifar100
+    - mnist
+  features:
+    batch_size: 64
+    dataset: coco
+    num_workers: 4
+  layer_selection:
+    best_only: true
+    last_only: false
+  training:
+    alignment_layer_kwargs:
+      cls_attn_beta_init: 1.0
+      cls_attn_prior: true
+      num_anchors: 128
+      pool_temperature: 0.05
+      projector_dim: 0
+    alignment_layer_name: BridgeAnchorTokenAlignmentLayer
+    batch_size: 4096
+    clip_loss:
+      normalize_latents: true
+      structure_lambda: 0
+      structure_levels: 1
+      structure_margin: 0.0
+      structure_weighting: none
+      temperature: 0.05
+      warmup_steps: 1000
+    clip_loss_name: CLIPLoss
+    log_structural_preservation: false
+    token_level: true
+    visualize_original_embeddings: false

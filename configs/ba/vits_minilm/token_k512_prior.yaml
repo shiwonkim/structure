@@ -1,0 +1,52 @@
+defaults: !include ../../default.yaml
+
+overrides:
+    alignment:
+        llm_model_name: "sentence-transformers/all-MiniLM-L6-v2"
+        lvm_model_name: "vit_small_patch14_dinov2.lvd142m"
+
+    features:
+        dataset: "coco"
+        batch_size: 64
+        num_workers: 4
+
+    layer_selection:
+        best_only: true
+        last_only: false
+
+    training:
+        token_level: true
+
+        alignment_layer_name: "BridgeAnchorTokenAlignmentLayer"
+        alignment_layer_kwargs:
+            num_anchors: 512
+            cls_attn_prior: true
+            cls_attn_beta_init: 1.0
+            pool_temperature: 0.05
+            projector_dim: 0
+
+        batch_size: 4096
+
+        clip_loss_name: "CLIPLoss"
+        clip_loss:
+            temperature: 0.05
+            normalize_latents: true
+            warmup_steps: 1000
+            structure_lambda: 0
+            structure_levels: 1
+            structure_margin: 0.0
+            structure_weighting: "none"
+
+        visualize_original_embeddings: false
+        log_structural_preservation: false
+
+    evaluation:
+        token_level_zero_shot: true
+        zero_shot_datasets:
+            - "cifar10"
+            - "stl10"
+            - "cifar100"
+            - "mnist"
+        retrieval_datasets:
+            - "flickr30"
+            - "coco"

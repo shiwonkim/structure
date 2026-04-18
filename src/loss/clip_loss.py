@@ -70,7 +70,21 @@ def structure_reg(
     """
     Compute structure regularizer loss between original and aligned embeddings.
     Preserves relationships at multiple scales.
+
+    Both inputs must be 2D ``(B, D)``. For token-level alignment methods
+    (Token BA, FreezeAlign) the trainer passes the raw token tensor
+    ``(B, T, D)`` as ``original_embeddings``; in that case we reduce to
+    ``original_embeddings[:, 0, :]`` (CLS slice), which keeps the
+    regularizer operating on a per-sample sentence/image-level embedding
+    that's directly comparable to the ``(B, K)`` aligned profile returned
+    by the CAP head.
     """
+    # Token-level safety: reduce 3D token tensors to their CLS slice.
+    if original_embeddings.dim() == 3:
+        original_embeddings = original_embeddings[:, 0, :]
+    if aligned_embeddings.dim() == 3:
+        aligned_embeddings = aligned_embeddings[:, 0, :]
+
     with torch.amp.autocast("cuda", enabled=False):
         # normalize embeddings for numerical stability
         if center_first:
