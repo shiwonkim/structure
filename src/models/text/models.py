@@ -70,6 +70,11 @@ def load_llm(llm_model_path, qlora=False, force_download=False, from_init=False)
             output_hidden_states=True,
             cache_dir="HuggingFaceCache/",
             trust_remote_code=True,
+            # Force eager attention: PyTorch 2.1 SDPA's cutlass mem-efficient
+            # backend raises "cutlassF: no kernel found to launch!" on Turing
+            # GPUs (RTX 8000 sm_75) for RoBERTa-Large's head_dim=64. Eager
+            # path uses plain matmul + softmax and works on every arch.
+            attn_implementation="eager",
         ).eval()
 
     return language_model

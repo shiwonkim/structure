@@ -55,7 +55,6 @@ class Trainer(ABC, object):
                 )
                 run_name = f"{experiment_name}-{wandb.run.name}"
                 wandb.run.name = run_name
-                wandb.run.save()
             self.run_dir = Path(wandb.run.dir)
         else:
             current_directory = self.config.get("work_dir", os.getcwd())

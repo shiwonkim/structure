@@ -186,7 +186,13 @@ class AlignmentTrainer(Trainer):
         )
 
         if save_path.exists():
-            llm_feats = torch.load(save_path, weights_only=False)["features"]
+            # mmap=True: feature cache is file-backed, pages shared via
+            # OS page cache between concurrent training processes. Drops
+            # per-process Committed_AS by ~50–100 GB on ViT-L/RoBERTa-L
+            # runs and avoids blowing Server B's CommitLimit of ~136 GB.
+            llm_feats = torch.load(
+                str(save_path), weights_only=False, mmap=True
+            )["features"]
             logger.debug(f"Loaded features from: {save_path}")
             return llm_feats
 
@@ -291,7 +297,10 @@ class AlignmentTrainer(Trainer):
         )
 
         if save_path.exists():
-            lvm_feats = torch.load(save_path, weights_only=False)["features"]
+            # mmap=True: see get_text_features cache load for rationale.
+            lvm_feats = torch.load(
+                str(save_path), weights_only=False, mmap=True
+            )["features"]
             logger.debug(f"Loaded features from: {save_path}")
             return lvm_feats
 

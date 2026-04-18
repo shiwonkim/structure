@@ -38,7 +38,13 @@ features:
     template_key: "label"
     precompute_captions: true
 
-    num_workers: 8
+    # Server B: dropped 8 → 0 (no worker forks at all). Under the
+    # container's vm.overcommit_memory=0 (heuristic) setting, even 2
+    # DataLoader worker forks get refused with ENOMEM after the
+    # trainer has loaded ViT-L/RoBERTa-L weights and feature caches.
+    # num_workers=0 runs the loader in the main process — zero throughput
+    # cost on cached feature training, zero fork risk.
+    num_workers: 0
     batch_size: 16
 
 alignment:
@@ -124,7 +130,12 @@ training:
 
 evaluation:
     batch_size: 256
-    num_workers: 8
+    # Server B: 8 → 0. evaluate_retrieval() inside fit() spawns a
+    # DataLoader for COCO/Flickr retrieval eval which forks 8 workers;
+    # that fork is refused under vm.overcommit_memory=0 after the
+    # trainer has loaded ViT-L + RoBERTa-L + feature caches. See the
+    # matching features.num_workers comment above.
+    num_workers: 0
     num_classes_per_batch: 2
     use_extended_prompts: true
     sample_by_sample_embedding: false
