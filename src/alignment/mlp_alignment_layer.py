@@ -2,9 +2,11 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from src.alignment.alignment_factory import AlignmentFactory
 from src.alignment.base_alignment_layer import BaseAlignmentLayer
+from src.alignment.linear_alignment_layer import _masked_mean_pool
 
 
 @AlignmentFactory.register()
@@ -26,12 +28,17 @@ class MLPAlignmentLayer(BaseAlignmentLayer):
             self.mlp.append(nn.ReLU())
             self.mlp.append(torch.nn.Linear(dim_alignment, dim_alignment))
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        z = self.mlp(z)
-        # normalize logits to the hypersphere.
+    def forward(
+        self, z: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        projected = self.mlp(z)
+
+        if projected.dim() == 3:
+            projected = _masked_mean_pool(projected, mask)
+
         if self.normalize_to_hypersphere:
-            return nn.functional.normalize(z, p=2, dim=1)
-        return z
+            return F.normalize(projected, p=2, dim=-1)
+        return projected
 
 
 def orthogonal_linear(layer: nn.Linear, gain: float = 1.0):
@@ -93,7 +100,14 @@ class ResLowRankHead(BaseAlignmentLayer):
     def alpha(self):
         return torch.sigmoid(self.logit_alpha)
 
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, z: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         z0 = self.P(z)
         delta = self.W2(self.dropout(self.act(self.W1(z))))
-        return z0 + self.alpha * delta
+        projected = z0 + self.alpha * delta
+
+        if projected.dim() == 3:
+            projected = _masked_mean_pool(projected, mask)
+
+        return projected

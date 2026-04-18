@@ -149,6 +149,83 @@ BA is in the same ballpark as Linear/MLP/ResLowRankHead on the dry-run.
 
 ## Change History
 
+### 2026-04-18 — Token-level support for Linear and MLP alignment layers
+
+**Goal.** Extend STRUCTURE's existing CLS-only Linear and ResLowRankHead (MLP)
+alignment layers to accept token-level `(B, T, D)` input, creating a clean
+ablation ladder: CLS-only → token-level mean-pool → token-level CAP (BA).
+
+**Design.** Follows STRUCTURE's symmetric convention (both modalities get
+independent projection layers, unlike bridge-anchors' asymmetric image-only
+projection). The `nn.Linear` / `nn.Sequential` already broadcasts over the
+token dimension, so the only addition is a mean-pool step after projection:
+
+```
+(B, T, D) → per-token projection → (B, T, D_out) → masked_mean_pool → (B, D_out)
+```
+
+When input is 2D `(B, D)`, forward behaves identically to the original —
+full backward compatibility with existing CLS checkpoints and configs.
+
+**CLS token handling.** All token-level methods now use the **full sequence**
+(CLS + patches, T=257 for ViT at 224px) rather than stripping CLS. This
+applies uniformly to Linear-token, MLP-token, Token BA CAP, and FreezeAlign.
+Rationale: creates a clean progression where CLS-only uses just position 0 and
+token-level adds local patch information on top.
+
+**Code changes.**
+
+- `src/alignment/linear_alignment_layer.py`:
+  - Added `_masked_mean_pool(x, mask)` helper (shared with MLP).
+  - `forward(z, mask=None)` — 3D branch: project per-token → masked mean-pool.
+  - Fixed `F.normalize` dim from `dim=1` to `dim=-1` for robustness.
+
+- `src/alignment/mlp_alignment_layer.py`:
+  - `MLPAlignmentLayer.forward(z, mask=None)` — same pattern.
+  - `ResLowRankHead.forward(z, mask=None)` — same pattern after gated
+    residual computation.
+
+- `src/loss/clip_loss.py`:
+  - `structure_reg` 3D reduction changed from CLS-slice `[:, 0, :]` to
+    `mean(dim=1)`. Mean-pool matches what the alignment layers compute,
+    ensuring the structure regularizer measures inter-sample topology
+    on the same representation the CLIP loss sees.
+
+**Configs (8 new files).**
+
+| Config | Method | Encoder | STR |
+|---|---|---|---|
+| `configs/linear/vits_minilm/linear_d512_token.yaml` | Linear | ViT-S + MiniLM | No |
+| `configs/linear/vits_minilm/linear_d512_token_struct.yaml` | Linear | ViT-S + MiniLM | Yes (λ=10) |
+| `configs/mlp/vits_minilm/mlp_d512_token.yaml` | MLP | ViT-S + MiniLM | No |
+| `configs/mlp/vits_minilm/mlp_d512_token_struct.yaml` | MLP | ViT-S + MiniLM | Yes (λ=10) |
+| `configs/linear/vitl_roberta/linear_d512_token.yaml` | Linear | ViT-L + RoBERTa | No |
+| `configs/linear/vitl_roberta/linear_d512_token_struct.yaml` | Linear | ViT-L + RoBERTa | Yes (λ=10) |
+| `configs/mlp/vitl_roberta/mlp_d512_token.yaml` | MLP | ViT-L + RoBERTa | No |
+| `configs/mlp/vitl_roberta/mlp_d512_token_struct.yaml` | MLP | ViT-L + RoBERTa | Yes (λ=10) |
+
+All set `training.token_level: true` and `evaluation.token_level_zero_shot: true`.
+
+**Smoke tests (5/5 pass).**
+
+| Test | Input | Output | Grads | Notes |
+|---|---|---|---|---|
+| LinearAlignmentLayer 3D | `(4, 257, 384)` + mask | `(4, 512)` L2=1.0 | ✓ linear_mapping | Masked sample pools over 200 valid tokens |
+| LinearAlignmentLayer 2D | `(4, 384)` | `(4, 512)` | — | CLS fallback unchanged |
+| ResLowRankHead 3D | `(4, 257, 384)` + mask | `(4, 512)` | ✓ P, W1 | Gated residual broadcasts correctly |
+| ResLowRankHead 2D | `(4, 384)` | `(4, 512)` | — | CLS fallback unchanged |
+| BridgeAnchorTokenAlignmentLayer | `(4, 257, 384)` | `(4, 128)` L2=1.0 | ✓ anchors | CAP over full 257 tokens including CLS |
+| FreezeAlignAlignmentLayer image | `(4, 257, 384)` | `(4, 512)` L2=1.0 | — | Splits CLS/patches internally |
+| FreezeAlignAlignmentLayer text | `(4, 16, 384)` + mask | `(4, 512)` L2=1.0 | — | Masked mean-pool → text_proj |
+| structure_reg 3D | `(4, 257, 384)` orig + `(4, 512)` aligned | loss=0.000024 | — | Mean-pool reduction, no crash |
+
+**Backward compatibility.** All existing CLS-only checkpoints and configs
+are unaffected: 2D input skips the mean-pool branch and follows the original
+code path exactly. The `mask` kwarg defaults to `None` so existing call sites
+need no changes.
+
+---
+
 ### 2026-04-15 — Zero-shot segmentation evaluation (unified 4-method × 2-strategy framework)
 
 **Goal.** Add an open-vocabulary semantic-segmentation eval path so BA's
