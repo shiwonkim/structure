@@ -8,7 +8,7 @@ overrides:
     features:
         dataset: "coco"
         batch_size: 64
-        num_workers: 4
+        num_workers: 0
 
     layer_selection:
         best_only: true

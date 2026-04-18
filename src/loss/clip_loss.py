@@ -40,6 +40,8 @@ def compute_similarity(
     temperature=None,
     gamma=None,
 ) -> torch.Tensor:
+    if embeddings.ndim == 3:
+        embeddings = embeddings.mean(dim=1)
     if distance_type == DistanceFunction.cosine:
         assert temperature is not None
         return (embeddings @ embeddings.T) / temperature
