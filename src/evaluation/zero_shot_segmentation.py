@@ -206,6 +206,77 @@ CITYSCAPES_PROMPTS: Dict[str, str] = {c: c for c in CITYSCAPES_CLASSES}
 CITYSCAPES_IGNORE_INDEX = 255
 
 
+# COCO-Object 80 thing categories (contiguous 1..80, 0 = background).
+# Order follows sorted original category IDs from instances_val2017.json.
+COCO_OBJECT_CLASSES: List[str] = [
+    "background",
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "stop sign",
+    "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep",
+    "cow", "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella",
+    "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard",
+    "sports ball", "kite", "baseball bat", "baseball glove", "skateboard",
+    "surfboard", "tennis racket", "bottle", "wine glass", "cup", "fork",
+    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "dining table", "toilet", "tv",
+    "laptop", "mouse", "remote", "keyboard", "cell phone", "microwave",
+    "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase",
+    "scissors", "teddy bear", "hair drier", "toothbrush",
+]
+assert len(COCO_OBJECT_CLASSES) == 81
+COCO_OBJECT_PROMPTS: Dict[str, str] = {c: c for c in COCO_OBJECT_CLASSES}
+COCO_OBJECT_IGNORE_INDEX = 255
+
+# COCO-Stuff: 183 real classes (IDs 1..183). Class 0 = unlabeled (ignore).
+# 1-91 = thing categories (80 COCO + 11 gap-fillers from cocostuff),
+# 92-183 = 92 stuff categories. Pixel maps from the official COCO release
+# contain only stuff labels (92-183, 0); thing labels are rasterised from
+# instances_val2017.json and painted on top.
+COCO_STUFF_CLASSES: List[str] = [
+    "unlabeled",
+    # Things (1-91)
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train",
+    "truck", "boat", "traffic light", "fire hydrant", "street sign",
+    "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse",
+    "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "hat",
+    "backpack", "umbrella", "shoe", "eye glasses", "handbag", "tie",
+    "suitcase", "frisbee", "skis", "snowboard", "sports ball", "kite",
+    "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket", "bottle", "plate", "wine glass", "cup", "fork",
+    "knife", "spoon", "bowl", "banana", "apple", "sandwich", "orange",
+    "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+    "couch", "potted plant", "bed", "mirror", "dining table", "window",
+    "desk", "toilet", "door", "tv", "laptop", "mouse", "remote",
+    "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+    "refrigerator", "blender", "book", "clock", "vase", "scissors",
+    "teddy bear", "hair drier", "toothbrush", "hair brush",
+    # Stuff (92-183)
+    "banner", "blanket", "branch", "bridge", "building-other", "bush",
+    "cabinet", "cage", "cardboard", "carpet", "ceiling-other",
+    "ceiling-tile", "cloth", "clothes", "clouds", "counter", "cupboard",
+    "curtain", "desk-stuff", "dirt", "door-stuff", "fence",
+    "floor-marble", "floor-other", "floor-stone", "floor-tile",
+    "floor-wood", "flower", "fog", "food-other", "fruit",
+    "furniture-other", "grass", "gravel", "ground-other", "hill", "house",
+    "leaves", "light", "mat", "metal", "mirror-stuff", "moss", "mountain",
+    "mud", "napkin", "net", "paper", "pavement", "pillow", "plant-other",
+    "plastic", "platform", "playingfield", "railing", "railroad", "river",
+    "road", "rock", "roof", "rug", "salad", "sand", "sea", "shelf",
+    "sky-other", "skyscraper", "snow", "solid-other", "stairs", "stone",
+    "straw", "structural-other", "table", "tent", "textile-other",
+    "towel", "tree", "vegetable", "wall-brick", "wall-concrete",
+    "wall-other", "wall-panel", "wall-stone", "wall-tile", "wall-wood",
+    "water-other", "waterdrops", "window-blind", "window-other", "wood",
+    "other",
+]
+assert len(COCO_STUFF_CLASSES) == 184, f"expected 184 (0=unlabeled + 183 classes), got {len(COCO_STUFF_CLASSES)}"
+COCO_STUFF_PROMPTS: Dict[str, str] = {
+    c: c.replace("-", " ") for c in COCO_STUFF_CLASSES
+}
+COCO_STUFF_IGNORE_INDEX = 0
+
+
 @dataclass
 class DatasetSpec:
     name: str
@@ -254,6 +325,28 @@ class DatasetSpec:
             num_classes=len(ADE20K_CLASSES),
             ignore_index=ADE20K_IGNORE_INDEX,
             has_background=False,   # the "background" at index 0 is unknown, not a real class
+        )
+
+    @classmethod
+    def for_coco_object(cls) -> "DatasetSpec":
+        return cls(
+            name="coco_object",
+            classes=COCO_OBJECT_CLASSES,
+            prompts=COCO_OBJECT_PROMPTS,
+            num_classes=len(COCO_OBJECT_CLASSES),
+            ignore_index=COCO_OBJECT_IGNORE_INDEX,
+            has_background=True,
+        )
+
+    @classmethod
+    def for_coco_stuff(cls) -> "DatasetSpec":
+        return cls(
+            name="coco_stuff",
+            classes=COCO_STUFF_CLASSES,
+            prompts=COCO_STUFF_PROMPTS,
+            num_classes=len(COCO_STUFF_CLASSES),
+            ignore_index=COCO_STUFF_IGNORE_INDEX,
+            has_background=False,  # class 0 is "unlabeled" (ignore), not background
         )
 
     @classmethod
@@ -686,6 +779,203 @@ class PascalContext59Dataset:
         return img, Image.fromarray(remapped.astype(np.uint8))
 
 
+class COCOObjectDataset:
+    """COCO-Object 2017 val — 80 thing classes + background.
+
+    Rasterises instance polygons from ``instances_val2017.json`` into
+    per-pixel semantic segmentation masks. For overlapping instances the
+    smaller-area one is painted on top (standard protocol).
+
+    Expects::
+
+        data_root/
+            val2017/                   ← 5,000 JPEGs
+            annotations/
+                instances_val2017.json ← instance annotations
+
+    Class 0 = background, 1..80 = the 80 COCO thing categories (remapped
+    from non-contiguous original IDs). Unlabeled/crowd pixels are set to
+    ``ignore_index=255``.
+    """
+
+    def __init__(self, data_root: str):
+        import pycocotools.coco as coco_api
+
+        root = Path(data_root)
+        ann_file = root / "annotations" / "instances_val2017.json"
+        if not ann_file.exists():
+            raise FileNotFoundError(f"instances_val2017.json not found at {ann_file}")
+        self.img_dir = root / "val2017"
+        if not self.img_dir.exists():
+            raise FileNotFoundError(f"val2017/ not found at {self.img_dir}")
+
+        self.coco = coco_api.COCO(str(ann_file))
+        self.ids = sorted(self.coco.getImgIds())
+
+        cat_ids = sorted(self.coco.getCatIds())
+        self._cat_id_to_contiguous = {cid: i + 1 for i, cid in enumerate(cat_ids)}
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        img_id = self.ids[idx]
+        img_info = self.coco.loadImgs(img_id)[0]
+        img = Image.open(self.img_dir / img_info["file_name"]).convert("RGB")
+        H, W = img_info["height"], img_info["width"]
+
+        mask = np.zeros((H, W), dtype=np.int64)
+        anns = self.coco.loadAnns(self.coco.getAnnIds(imgIds=img_id))
+        anns = sorted(anns, key=lambda a: a["area"], reverse=True)
+        for ann in anns:
+            if ann.get("iscrowd", 0):
+                continue
+            cat_idx = self._cat_id_to_contiguous.get(ann["category_id"], 0)
+            binary = self.coco.annToMask(ann)
+            mask[binary > 0] = cat_idx
+
+        return img, Image.fromarray(mask.astype(np.uint8))
+
+
+class COCOStuff171Dataset:
+    """COCO-Stuff val split — 91 thing + 91 stuff = 182 classes.
+
+    Rasterises both instance (thing) and stuff annotations from JSON
+    into per-pixel semantic masks using pycocotools. Things are painted
+    on top of stuff where they overlap (standard protocol).
+
+    Supports two annotation layouts:
+
+    1. **Pixel maps** (preferred, from cocostuff release)::
+
+        data_root/
+            val2017/                         ← 5,000 JPEGs
+            stuffthingmaps_trainval2017/
+                val2017/                     ← 5,000 PNGs (pixel labels)
+
+    2. **JSON annotations** (fallback, from COCO official site)::
+
+        data_root/
+            val2017/
+            annotations/
+                instances_val2017.json       ← thing annotations
+                stuff_val2017.json           ← stuff annotations
+
+    Class 0 = unlabeled (ignore). Classes 1-91 = things, 92-182 = stuff.
+    """
+
+    def __init__(self, data_root: str):
+        import pycocotools.coco as coco_api
+
+        root = Path(data_root)
+        self.img_dir = root / "val2017"
+        if not self.img_dir.exists():
+            raise FileNotFoundError(f"val2017/ not found at {self.img_dir}")
+
+        # Instance annotations needed in both modes (things overlay)
+        inst_json = root / "annotations" / "instances_val2017.json"
+        if inst_json.exists():
+            self._coco_inst = coco_api.COCO(str(inst_json))
+            inst_cats = sorted(self._coco_inst.getCatIds())
+            # Map COCO's non-contiguous thing IDs → cocostuff contiguous 1-91
+            # The cocostuff labels.txt defines this mapping; we replicate it
+            # by assigning sequential IDs 1..N_things to sorted category IDs.
+            self._inst_cat_map = {cid: i + 1 for i, cid in enumerate(inst_cats)}
+        else:
+            self._coco_inst = None
+            self._inst_cat_map = {}
+            logger.warning(
+                f"instances_val2017.json not found at {inst_json}; "
+                "thing classes will be missing from COCO-Stuff masks"
+            )
+
+        # Try pixel maps first (stuff-only, things overlaid from instances)
+        pixmap_dir = root / "stuffthingmaps_trainval2017" / "val2017"
+        if pixmap_dir.exists() and len(list(pixmap_dir.glob("*.png"))) > 0:
+            self._mode = "pixelmap"
+            self._ann_dir = pixmap_dir
+            self.ids = sorted(p.stem for p in pixmap_dir.glob("*.png"))
+            logger.info(f"COCO-Stuff: using pixel maps from {pixmap_dir}")
+        else:
+            # Fallback to JSON
+            inst_json = root / "annotations" / "instances_val2017.json"
+            stuff_json = root / "annotations" / "stuff_val2017.json"
+            if not inst_json.exists() or not stuff_json.exists():
+                raise FileNotFoundError(
+                    f"Need either pixel maps at {pixmap_dir} or JSON "
+                    f"annotations at {inst_json.parent}. Found neither."
+                )
+            self._mode = "json"
+            self._coco_inst = coco_api.COCO(str(inst_json))
+            self._coco_stuff = coco_api.COCO(str(stuff_json))
+            self.ids = sorted(self._coco_stuff.getImgIds())
+            # Build thing category mapping: original COCO cat_id → cocostuff 1-91
+            # The cocostuff labels 1-91 follow the order in labels.txt; COCO's
+            # original non-contiguous IDs need remapping.
+            inst_cats = sorted(self._coco_inst.getCatIds())
+            stuff_cats = sorted(self._coco_stuff.getCatIds())
+            self._inst_cat_map = {cid: i + 1 for i, cid in enumerate(inst_cats)}
+            self._stuff_cat_map = {cid: i + 92 for i, cid in enumerate(stuff_cats)}
+            logger.info(
+                f"COCO-Stuff: using JSON annotations "
+                f"({len(inst_cats)} thing + {len(stuff_cats)} stuff categories)"
+            )
+
+    def __len__(self):
+        return len(self.ids)
+
+    def __getitem__(self, idx):
+        if self._mode == "pixelmap":
+            image_id = self.ids[idx]
+            img = Image.open(self.img_dir / f"{image_id}.jpg").convert("RGB")
+            mask = np.array(Image.open(self._ann_dir / f"{image_id}.png"))
+            # Pixel maps contain only stuff (92-183) + unlabeled (0).
+            # Overlay thing instances from instances_val2017.json.
+            if self._coco_inst is not None:
+                img_id_int = int(image_id)
+                anns = self._coco_inst.loadAnns(
+                    self._coco_inst.getAnnIds(imgIds=img_id_int)
+                )
+                anns = sorted(anns, key=lambda a: a["area"], reverse=True)
+                for ann in anns:
+                    if ann.get("iscrowd", 0):
+                        continue
+                    cat_idx = self._inst_cat_map.get(ann["category_id"], 0)
+                    binary = self._coco_inst.annToMask(ann)
+                    mask[binary > 0] = cat_idx
+            return img, Image.fromarray(mask.astype(np.uint8))
+
+        # JSON mode: rasterise stuff first, then paint things on top
+        img_id = self.ids[idx]
+        img_info = self._coco_stuff.loadImgs(img_id)[0]
+        img = Image.open(self.img_dir / img_info["file_name"]).convert("RGB")
+        H, W = img_info["height"], img_info["width"]
+
+        mask = np.zeros((H, W), dtype=np.int64)  # 0 = unlabeled
+
+        # Stuff (background layer)
+        for ann in self._coco_stuff.loadAnns(
+            self._coco_stuff.getAnnIds(imgIds=img_id)
+        ):
+            cat_idx = self._stuff_cat_map.get(ann["category_id"], 0)
+            binary = self._coco_stuff.annToMask(ann)
+            mask[binary > 0] = cat_idx
+
+        # Things on top (smaller-area first = larger area painted first)
+        thing_anns = self._coco_inst.loadAnns(
+            self._coco_inst.getAnnIds(imgIds=img_id)
+        )
+        thing_anns = sorted(thing_anns, key=lambda a: a["area"], reverse=True)
+        for ann in thing_anns:
+            if ann.get("iscrowd", 0):
+                continue
+            cat_idx = self._inst_cat_map.get(ann["category_id"], 0)
+            binary = self._coco_inst.annToMask(ann)
+            mask[binary > 0] = cat_idx
+
+        return img, Image.fromarray(mask.astype(np.uint8))
+
+
 class ADE20KDataset:
     """ADE20K ADEChallenge2016 val split.
 
@@ -740,6 +1030,12 @@ def build_dataset(name: str, data_root: str, download: bool):
             root=data_root, split="val", mode="fine", target_type="semantic",
         )
         return ds, DatasetSpec.for_cityscapes()
+    if name == "coco_object":
+        ds = COCOObjectDataset(data_root=data_root)
+        return ds, DatasetSpec.for_coco_object()
+    if name == "coco_stuff":
+        ds = COCOStuff171Dataset(data_root=data_root)
+        return ds, DatasetSpec.for_coco_stuff()
     raise ValueError(f"unsupported segmentation dataset {name!r}")
 
 
@@ -1014,7 +1310,7 @@ def main():
     parser.add_argument("--layer-txt", type=int, required=True)
     parser.add_argument(
         "--dataset", default="voc2012",
-        choices=["voc2012", "pascal_context", "ade20k", "cityscapes"],
+        choices=["voc2012", "pascal_context", "ade20k", "cityscapes", "coco_object", "coco_stuff"],
     )
     parser.add_argument("--data-root", default="data/pascal_voc")
     parser.add_argument("--download", action="store_true")

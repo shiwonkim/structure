@@ -1,0 +1,30 @@
+defaults: !include ../default.yaml
+
+overrides:
+    training:
+        clip: true
+
+    alignment:
+        # 224px version for fair comparison with DINOv2 ViT-L @ img_size=224.
+        # STRUCTURE reference used clip-vit-large-patch14-336 (336px).
+        llm_model_name: "openai/clip-vit-large-patch14"
+        lvm_model_name: "openai/clip-vit-large-patch14"
+
+    features:
+        dataset: "coco"
+        batch_size: 32
+        num_workers: 4
+
+    evaluation:
+        zero_shot_datasets:
+            - "cifar10"
+            - "stl10"
+            - "cifar100"
+            - "mnist"
+            - "dtd"
+            - "flowers"
+            - "gtsrb"
+            - "country211"
+        retrieval_datasets:
+            - "coco"
+            - "flickr30"

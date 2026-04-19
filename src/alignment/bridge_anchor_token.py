@@ -75,6 +75,7 @@ class BridgeAnchorTokenAlignmentLayer(BaseAlignmentLayer):
         dim_alignment: int | None = None,
         cls_attn_prior: bool = False,
         cls_attn_beta_init: float = 1.0,
+        pool_method: str = "cap",
     ):
         super().__init__(input_dim=input_dim)
 
@@ -86,6 +87,7 @@ class BridgeAnchorTokenAlignmentLayer(BaseAlignmentLayer):
         self.pool_temperature = pool_temperature
         self.projector_dim = projector_dim
         self.init_method = init_method
+        self.pool_method = pool_method
 
         self.anchors = nn.Parameter(torch.empty(num_anchors, input_dim))
         if init_method in ("random", "normal"):
@@ -133,6 +135,15 @@ class BridgeAnchorTokenAlignmentLayer(BaseAlignmentLayer):
         a_norm = F.normalize(self.anchors, dim=-1)   # (K, D)
         sim = z_norm @ a_norm.T                       # (B, T, K)
 
+        if self.pool_method == "mean":
+            if mask is not None:
+                mask_f = mask.unsqueeze(-1).float()   # (B, T, 1)
+                profile = (sim * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)
+            else:
+                profile = sim.mean(dim=1)             # (B, K)
+            return F.normalize(profile, dim=-1)
+
+        # CAP path (default)
         logits = sim / self.pool_temperature         # (B, T, K)
 
         # CLS-attention prior. Silently skipped if cls_attn is None or

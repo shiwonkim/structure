@@ -95,21 +95,9 @@ class CLIPEvalTrainer(AlignmentTrainer):
 
         model = CLIPModel.from_pretrained(self.lvm_model_name).to(self.device)
         processor = CLIPProcessor.from_pretrained(self.lvm_model_name)
-        feat_processor = processor.image_processor  # holds mean/std
 
         language_model, tokenizer = self.get_llm(llm_model_name=self.llm_model_name)
         for eval_dataset_name, e_dataset in self.eval_zero_shot_datasets:
-            image_transform = transforms.Compose(
-                [
-                    transforms.Resize((336, 336)),
-                    transforms.ToTensor(),
-                ]
-            )
-            set_transform_dataset(
-                dataset=e_dataset,
-                image_transform=image_transform,
-            )
-
             save_path_vision = AlignmentTrainer.get_feature_save_path(
                 m_name=self.lvm_model_name,
                 d_name=eval_dataset_name,
@@ -227,18 +215,13 @@ class CLIPEvalTrainer(AlignmentTrainer):
                     else:
                         raise ValueError(f"Unknown length of batch: {len(batch)}")
 
-                    images = images.to(self.device, non_blocking=True)
-                    # normalize per CLIP spec
-                    mean = torch.tensor(
-                        feat_processor.image_mean, device=self.device
-                    ).view(1, 3, 1, 1)
-                    std = torch.tensor(
-                        feat_processor.image_std, device=self.device
-                    ).view(1, 3, 1, 1)
-                    pixel_values = (images.to(self.device) - mean) / std
-                    # forward
+                    if isinstance(images, list):
+                        inputs = processor(images=images, return_tensors="pt")
+                        pixel_values = inputs["pixel_values"].to(self.device)
+                    else:
+                        inputs = processor(images=images, return_tensors="pt")
+                        pixel_values = inputs["pixel_values"].to(self.device)
                     feats = model.get_image_features(pixel_values=pixel_values)
-                    # normalize
                     lvm_output = feats / feats.norm(p=2, dim=-1, keepdim=True)
                     lvm_feats.append(lvm_output.cpu())
 
@@ -384,29 +367,14 @@ class CLIPEvalTrainer(AlignmentTrainer):
 
         model = CLIPModel.from_pretrained(lvm_model_name).to(self.device)
         processor = CLIPProcessor.from_pretrained(lvm_model_name)
-        feat_processor = processor.image_processor  # holds mean/std
-
-        image_transform = transforms.Resize((336, 336))
-        set_transform_dataset(
-            dataset=loader.dataset,
-            image_transform=image_transform,
-        )
 
         lvm_feats = []
         for batch in tqdm(loader, total=len(loader), file=sys.stdout):
             images, _ = batch
             with torch.no_grad():
-                # normalize per CLIP spec
-                mean = torch.tensor(feat_processor.image_mean, device=self.device).view(
-                    1, 3, 1, 1
-                )
-                std = torch.tensor(feat_processor.image_std, device=self.device).view(
-                    1, 3, 1, 1
-                )
-                pixel_values = (images.to(self.device) - mean) / std
-                # forward
+                inputs = processor(images=images, return_tensors="pt")
+                pixel_values = inputs["pixel_values"].to(self.device)
                 feats = model.get_image_features(pixel_values=pixel_values)
-                # normalize
                 feats = feats / feats.norm(p=2, dim=-1, keepdim=True)
                 lvm_feats.append(feats.cpu())
         lvm_feats = torch.cat(lvm_feats).cpu()
