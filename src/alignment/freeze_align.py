@@ -248,14 +248,6 @@ class FreezeAlignAlignmentLayer(BaseAlignmentLayer):
         return F.normalize(text_feat, dim=-1)
 
     # ------------------------------------------------------------------
-    # Structure reg reduction
-    # ------------------------------------------------------------------
-    # Uses the base class default: mean-pool all tokens (v2).
-    # v3 (patches_mean + CLS) was tested but performed worse — the
-    # summed representation has ~2× magnitude which makes the structure
-    # loss dominate and collapse retrieval.
-
-    # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
     def active_param_count(self) -> int:
