@@ -478,6 +478,62 @@ class BAAttentionMapMethod(SegmentationMethod):
         ).to(device)
 
 
+class LinearPerPatchMethod(SegmentationMethod):
+    """Per-patch projection through a trained Linear or MLP (ResLowRankHead)
+    alignment layer, WITHOUT the mean-pool step. Produces (P, D_out) per-patch
+    descriptors that can be compared against (C, D_out) text descriptors.
+
+    For Linear: patches → layer.linear_mapping → (P, D_out)
+    For ResLowRankHead: patches → P(z) + α·W₂(GELU(W₁(z))) → (P, D_out)
+
+    Text side uses the same alignment_text layer with token_level=True
+    so text features are in the same D_out space.
+    """
+    name = "linear_perpatch"
+    pool_txt = "none"
+
+    def __init__(self, alignment_image, alignment_text):
+        self.alignment_image = alignment_image
+        self.alignment_text = alignment_text
+
+    def get_patch_features(self, layer_feats, device):
+        with torch.no_grad():
+            patches = layer_feats[1:, :].to(device)  # (P, D), strip CLS
+            cls_name = type(self.alignment_image).__name__
+            if cls_name == "LinearAlignmentLayer":
+                return self.alignment_image.linear_mapping(patches)  # (P, D_out)
+            elif cls_name == "ResLowRankHead":
+                ai = self.alignment_image
+                z0 = ai.P(patches)
+                delta = ai.W2(ai.act(ai.W1(patches)))
+                return z0 + ai.alpha * delta  # (P, D_out)
+            elif cls_name == "MLPAlignmentLayer":
+                return self.alignment_image.mlp(patches)  # (P, D_out)
+            else:
+                raise ValueError(
+                    f"linear_perpatch not supported for {cls_name}"
+                )
+
+    def get_text_features(
+        self, classnames, templates, tokenizer, language_model,
+        layer_txt, device,
+    ):
+        return build_zero_shot_classifier(
+            language_model=language_model,
+            tokenizer=tokenizer,
+            classnames=classnames,
+            templates=templates,
+            dataset=None,
+            layer_index=layer_txt,
+            alignment_layer=self.alignment_text,
+            num_classes_per_batch=8,
+            device=device,
+            pool_txt="none",
+            save_path=None,
+            token_level=True,
+        ).to(device)
+
+
 # ------------------------------------------------------------------
 # Encoder + dataset + transform helpers
 # ------------------------------------------------------------------
@@ -891,6 +947,12 @@ def build_method(
             alignment_text=alignment_text,
             pool_temperature=pool_temperature,
         )
+    if name == "linear_perpatch":
+        if alignment_image is None:
+            raise ValueError("linear_perpatch requires --checkpoint")
+        return LinearPerPatchMethod(
+            alignment_image=alignment_image, alignment_text=alignment_text,
+        )
     raise ValueError(f"unknown method {name!r}")
 
 
@@ -910,6 +972,7 @@ def auto_filter_methods(
     layer_cls = type(alignment_image).__name__
     is_ba = "BridgeAnchor" in layer_cls
     is_fa = "FreezeAlign" in layer_cls
+    is_linear_mlp = layer_cls in ("LinearAlignmentLayer", "ResLowRankHead", "MLPAlignmentLayer")
     keep = []
     for m in requested:
         if m == "direct_cosine":
@@ -917,6 +980,8 @@ def auto_filter_methods(
         elif m == "freezealign" and is_fa:
             keep.append(m)
         elif m in ("anchor_codebook", "attention_map") and is_ba:
+            keep.append(m)
+        elif m == "linear_perpatch" and is_linear_mlp:
             keep.append(m)
         else:
             logger.warning(
@@ -955,7 +1020,7 @@ def main():
     parser.add_argument("--download", action="store_true")
     parser.add_argument(
         "--methods",
-        default="direct_cosine,freezealign,anchor_codebook,attention_map",
+        default="direct_cosine,freezealign,anchor_codebook,attention_map,linear_perpatch",
         help="Comma-separated method names",
     )
     parser.add_argument(

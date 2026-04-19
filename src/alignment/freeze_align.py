@@ -248,17 +248,12 @@ class FreezeAlignAlignmentLayer(BaseAlignmentLayer):
         return F.normalize(text_feat, dim=-1)
 
     # ------------------------------------------------------------------
-    # Structure reg reduction — mirrors the CLS + patches_mean architecture
+    # Structure reg reduction
     # ------------------------------------------------------------------
-    def reduce_for_structure_reg(self, z: torch.Tensor) -> torch.Tensor:
-        if z.dim() != 3:
-            return z
-        if self._modality == "image":
-            return z[:, 1:, :].mean(dim=1) + z[:, 0, :]
-        # Text: masked mean-pool is the natural reduction, but we don't
-        # have the mask here. Plain mean is acceptable — text padding
-        # tokens are near-zero in sentence-transformer outputs.
-        return z.mean(dim=1)
+    # Uses the base class default: mean-pool all tokens (v2).
+    # v3 (patches_mean + CLS) was tested but performed worse — the
+    # summed representation has ~2× magnitude which makes the structure
+    # loss dominate and collapse retrieval.
 
     # ------------------------------------------------------------------
     # Diagnostics
