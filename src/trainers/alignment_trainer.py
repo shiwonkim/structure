@@ -2184,12 +2184,18 @@ class AlignmentTrainer(Trainer):
                     aligned_text_features_fixed,
                 )
 
+            # Reduce 3D token originals for structure_reg using each
+            # layer's architecture-aware reduction (e.g. FreezeAlign
+            # uses patches_mean + CLS, others use plain mean-pool).
+            img_orig_for_loss = alignment_image.reduce_for_structure_reg(image_feats)
+            txt_orig_for_loss = alignment_text.reduce_for_structure_reg(text_feats)
+
             # backward pass with clip loss
             loss_dict = self.loss(
                 image_embeddings_aligned=aligned_image_feats,
                 text_embeddings_aligned=aligned_text_feats,
-                image_embeddings_original=image_feats,
-                text_embeddings_original=text_feats,
+                image_embeddings_original=img_orig_for_loss,
+                text_embeddings_original=txt_orig_for_loss,
                 **loss_kwargs,
             )
             loss = loss_dict["overall_loss"]
