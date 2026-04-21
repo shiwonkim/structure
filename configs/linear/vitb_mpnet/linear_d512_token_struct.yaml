@@ -1,0 +1,44 @@
+defaults: !include ../../default.yaml
+
+overrides:
+    alignment:
+        llm_model_name: "sentence-transformers/all-mpnet-base-v2"
+        lvm_model_name: "vit_base_patch14_dinov2.lvd142m"
+
+    features:
+        batch_size: 64
+        num_workers: 4
+
+    training:
+        token_level: true
+
+        alignment_layer_name: "LinearAlignmentLayer"
+        alignment_layer_kwargs:
+            dim_alignment: 512
+
+        batch_size: 4096
+
+        clip_loss_name: "CLIPLoss"
+        clip_loss:
+            temperature: 0.05
+            normalize_latents: true
+            warmup_steps: 1000
+            structure_lambda: 10.0
+            structure_levels: 1
+            structure_margin: 0.0
+            structure_weighting: "none"
+
+    layer_selection:
+        best_only: true
+        last_only: false
+
+    evaluation:
+        token_level_zero_shot: true
+        zero_shot_datasets:
+            - "cifar10"
+            - "stl10"
+            - "cifar100"
+            - "mnist"
+        retrieval_datasets:
+            - "flickr30"
+            - "coco"

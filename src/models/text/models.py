@@ -60,9 +60,7 @@ def load_llm(llm_model_path, qlora=False, force_download=False, from_init=False)
         )
         language_model = language_model.eval()
     else:
-        language_model = AutoModel.from_pretrained(
-            llm_model_path,
-            device_map="auto",
+        load_kwargs = dict(
             quantization_config=quantization_config,
             torch_dtype=torch_dtype,
             force_download=force_download,
@@ -70,12 +68,17 @@ def load_llm(llm_model_path, qlora=False, force_download=False, from_init=False)
             output_hidden_states=True,
             cache_dir="HuggingFaceCache/",
             trust_remote_code=True,
-            # Force eager attention: PyTorch 2.1 SDPA's cutlass mem-efficient
-            # backend raises "cutlassF: no kernel found to launch!" on Turing
-            # GPUs (RTX 8000 sm_75) for RoBERTa-Large's head_dim=64. Eager
-            # path uses plain matmul + softmax and works on every arch.
             attn_implementation="eager",
-        ).eval()
+        )
+        try:
+            language_model = AutoModel.from_pretrained(
+                llm_model_path, device_map="auto", **load_kwargs,
+            ).eval()
+        except ValueError:
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            language_model = AutoModel.from_pretrained(
+                llm_model_path, **load_kwargs,
+            ).to(device).eval()
 
     return language_model
 

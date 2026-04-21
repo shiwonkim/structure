@@ -210,11 +210,16 @@ class Trainer(ABC, object):
                 else:
                     aligned_txt_feats = alignment_text(txt_feats)
 
+                lr_loss_extra = {}
+                if hasattr(self.loss, "logit_scale"):
+                    lr_loss_extra["logit_scale"] = self.loss.logit_scale
+                    lr_loss_extra["logit_bias"] = self.loss.logit_bias
                 loss_dict = self.loss(
                     image_embeddings_aligned=aligned_img_feats,
                     text_embeddings_aligned=aligned_txt_feats,
                     image_embeddings_original=img_feats,
                     text_embeddings_original=txt_feats,
+                    **lr_loss_extra,
                 )
                 loss = loss_dict["overall_loss"]
                 loss.backward()

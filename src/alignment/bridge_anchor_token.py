@@ -135,7 +135,7 @@ class BridgeAnchorTokenAlignmentLayer(BaseAlignmentLayer):
         a_norm = F.normalize(self.anchors, dim=-1)   # (K, D)
         sim = z_norm @ a_norm.T                       # (B, T, K)
 
-        if self.pool_method == "mean":
+        if getattr(self, "pool_method", "cap") == "mean":
             if mask is not None:
                 mask_f = mask.unsqueeze(-1).float()   # (B, T, 1)
                 profile = (sim * mask_f).sum(dim=1) / mask_f.sum(dim=1).clamp(min=1)

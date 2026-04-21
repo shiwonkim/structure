@@ -1,6 +1,7 @@
 import ast
 import copy
 import gc
+import math
 import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -43,6 +44,7 @@ from src.evaluation.zero_shot_classifier import (
     chunked_logits,
 )
 from src.loss.clip_loss import CLIPLoss
+from src.loss.siglip_loss import SigLipLoss
 from src.measure_alignment import compute_score
 from src.models.text.models import load_llm, load_tokenizer
 from src.trainers.base_trainer import Trainer
@@ -1803,21 +1805,26 @@ class AlignmentTrainer(Trainer):
             )
 
             # define the loss function
-            self.loss = CLIPLoss(
-                **self.config["training"]["clip_loss"],
-            )
-            self.loss = self.loss.to(self.device)
+            loss_name = self.config["training"].get("clip_loss_name", "CLIPLoss")
+            if loss_name == "SigLipLoss":
+                self.loss = SigLipLoss(
+                    structure_lambda=self.config["training"]["clip_loss"].get("structure_lambda", 0),
+                ).to(self.device)
+            else:
+                self.loss = CLIPLoss(
+                    **self.config["training"]["clip_loss"],
+                ).to(self.device)
 
             alignment_image = AlignmentFactory.create(
                 self.config["training"]["alignment_layer_name"],
                 input_dim=image_dim,
                 **self.config["training"]["alignment_layer_kwargs"],
-            )
+            ).float()
             alignment_text = AlignmentFactory.create(
                 self.config["training"]["alignment_layer_name"],
                 input_dim=text_dim,
                 **self.config["training"]["alignment_layer_kwargs"],
-            )
+            ).float()
             # Some alignment layers (e.g. FreezeAlignAlignmentLayer) need to
             # know which modality they serve because they hold both modalities'
             # components in a single class. Backwards compatible: layers that
@@ -1875,6 +1882,8 @@ class AlignmentTrainer(Trainer):
             params = list(alignment_image.parameters()) + list(
                 alignment_text.parameters()
             )
+            if hasattr(self.loss, "logit_scale"):
+                params += list(self.loss.parameters())
 
             optimizer = optimizer_cls(
                 params=params,
@@ -2190,12 +2199,17 @@ class AlignmentTrainer(Trainer):
             img_orig_for_loss = alignment_image.reduce_for_structure_reg(image_feats)
             txt_orig_for_loss = alignment_text.reduce_for_structure_reg(text_feats)
 
-            # backward pass with clip loss
+            # backward pass with loss
+            loss_extra = {}
+            if hasattr(self.loss, "logit_scale"):
+                loss_extra["logit_scale"] = self.loss.logit_scale
+                loss_extra["logit_bias"] = self.loss.logit_bias
             loss_dict = self.loss(
                 image_embeddings_aligned=aligned_image_feats,
                 text_embeddings_aligned=aligned_text_feats,
                 image_embeddings_original=img_orig_for_loss,
                 text_embeddings_original=txt_orig_for_loss,
+                **loss_extra,
                 **loss_kwargs,
             )
             loss = loss_dict["overall_loss"]
@@ -2206,6 +2220,9 @@ class AlignmentTrainer(Trainer):
                 _ = clip_gradients(alignment_image, clip_grad)
                 _ = clip_gradients(alignment_text, clip_grad)
             optimizer.step()
+            if hasattr(self.loss, "logit_scale"):
+                with torch.no_grad():
+                    self.loss.logit_scale.clamp_(0, math.log(100))
             if scheduler is not None:
                 scheduler.step()
 
@@ -2360,12 +2377,16 @@ class AlignmentTrainer(Trainer):
             else:
                 aligned_text_feats = alignment_text(text_feats)
 
-            # backward pass with clip loss
+            val_loss_extra = {}
+            if hasattr(self.loss, "logit_scale"):
+                val_loss_extra["logit_scale"] = self.loss.logit_scale
+                val_loss_extra["logit_bias"] = self.loss.logit_bias
             loss_dict = self.loss(
                 image_embeddings_aligned=aligned_image_feats,
                 text_embeddings_aligned=aligned_text_feats,
                 image_embeddings_original=image_feats,
                 text_embeddings_original=text_feats,
+                **val_loss_extra,
             )
             # compute the median cosine similarity
             cos = torch.nn.functional.cosine_similarity(
@@ -2562,7 +2583,7 @@ class AlignmentTrainer(Trainer):
             )
             # we move it to the cpu since in the loop we move chunks back
             # (used to optimize memory for big models)
-            zero_shot_classifier = zero_shot_classifier.cpu()
+            zero_shot_classifier = zero_shot_classifier.float().cpu()
 
             eval_loader = DataLoader(
                 e_dataset,
@@ -2754,12 +2775,12 @@ class AlignmentTrainer(Trainer):
             log_str = f"{eval_dataset_name.capitalize()} -"
             for m_name, m in metrics_dict.items():
                 if "per_class" in m_name:
-                    score = m.compute().detach().numpy().tolist()
+                    score = m.compute().detach().float().numpy().tolist()
                     logger.info(m_name)
                     for i, s in enumerate(score):
                         logger.info(f"  - Class {dataset_classes[i]}: {s:.4f}")
                     result_dict[f"{eval_dataset_name}/{m_name}/std"] = (
-                        torch.std(m.compute()).detach().item()
+                        torch.std(m.compute().float()).detach().item()
                     )
                 elif "confusion_matrix" in m_name:
                     if len(dataset_classes) < 30:

@@ -590,7 +590,7 @@ def get_datasets(dataset, transform, root_dir: Union[str, Path] = "./data", **kw
             d.mapping_number_to_class = mapping_number_to_class
             d.classes = [d.class_mapping_dict.get(x) for x in d.classes]
 
-    elif dataset == "coco":
+    elif dataset in ("coco", "coco_karpathy"):
         coco_path = Path(data_path) / "COCO"
         anno_path = coco_path / "annotations"
 
@@ -612,6 +612,18 @@ def get_datasets(dataset, transform, root_dir: Union[str, Path] = "./data", **kw
             transform=transform,
             **kwargs,
         )
+
+        if dataset == "coco_karpathy":
+            karpathy_ids_path = coco_path / "karpathy_test_ids.json"
+            if karpathy_ids_path.exists():
+                import json as _json
+                with open(karpathy_ids_path) as _f:
+                    test_ids = set(_json.load(_f))
+                keep = val_dataset.df["image_path"].apply(
+                    lambda p: int(os.path.basename(p).split("_")[-1].split(".")[0]) in test_ids
+                )
+                val_dataset.df = val_dataset.df[keep].reset_index(drop=True)
+                val_dataset.name = "coco_karpathy"
 
     return train_dataset, val_dataset
 

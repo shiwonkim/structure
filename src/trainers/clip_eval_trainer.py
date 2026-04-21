@@ -66,6 +66,21 @@ class CLIPEvalTrainer(AlignmentTrainer):
         n_random_subsample_val: Optional[int] = None,
         additional_unimodal_data: Optional[Dict[str, list]] = None,
     ):
+        # Strip DINOv2 transforms so CLIPProcessor receives raw PIL
+        # images everywhere. CLIPProcessor handles resize + normalize
+        # internally and expects PIL input (tensor input gets
+        # double-normalized). Convert grayscale → RGB for datasets
+        # like MNIST that produce single-channel images.
+        to_rgb = transforms.Lambda(lambda x: x.convert("RGB") if hasattr(x, "convert") else x)
+        for loader in [self.train_dataset, self.val_dataset]:
+            set_transform_dataset(loader.dataset, to_rgb)
+        if self.eval_retrieval_datasets:
+            for _, ds in self.eval_retrieval_datasets:
+                set_transform_dataset(ds, to_rgb)
+        if self.eval_zero_shot_datasets:
+            for _, ds in self.eval_zero_shot_datasets:
+                set_transform_dataset(ds, to_rgb)
+
         res_dict = {}
         with torch.no_grad():
             self.evaluate_retrieval(
@@ -137,13 +152,23 @@ class CLIPEvalTrainer(AlignmentTrainer):
             # (used to optimize memory for big models)
             zero_shot_classifier = zero_shot_classifier.cpu()
 
+            def _pil_collate(batch):
+                if len(batch[0]) == 2:
+                    imgs, targets = zip(*batch)
+                elif len(batch[0]) == 3:
+                    imgs, _, targets = zip(*batch)
+                else:
+                    raise ValueError(f"Unknown batch format: {len(batch[0])} elements")
+                return list(imgs), torch.tensor(targets)
+
             eval_loader = DataLoader(
                 e_dataset,
                 batch_size=self.eval_batch_size,
                 num_workers=self.config["evaluation"]["num_workers"],
                 drop_last=False,
                 shuffle=False,
-                pin_memory=True,
+                pin_memory=False,
+                collate_fn=_pil_collate,
             )
 
             if save_path_vision is not None and save_path_vision.exists():
@@ -384,7 +409,7 @@ class CLIPEvalTrainer(AlignmentTrainer):
             save_dict["dataframe"] = loader.dataset.df
         torch.save(save_dict, save_path)
         logger.debug(f"Saved features to: {save_path}")
-        del model, processor, feat_processor
+        del model, processor
         return lvm_feats
 
     def evaluate_retrieval(
