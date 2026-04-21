@@ -27,7 +27,7 @@ overrides:
             temperature: 0.05
             normalize_latents: true
             warmup_steps: 1000
-            structure_lambda: 0
+            structure_lambda: 10.0
             structure_levels: 1
             structure_margin: 0.0
             structure_weighting: "none"

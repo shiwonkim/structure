@@ -7,7 +7,7 @@ overrides:
 
     features:
         batch_size: 64
-        num_workers: 4
+        num_workers: 0
 
     training:
         alignment_layer_name: "BridgeAnchorAlignmentLayer"

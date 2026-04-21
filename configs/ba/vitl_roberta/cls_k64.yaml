@@ -6,19 +6,13 @@ overrides:
         lvm_model_name: "vit_large_patch14_dinov2.lvd142m"
 
     features:
-        dataset: "coco"
         batch_size: 64
         num_workers: 0
 
-    layer_selection:
-        best_only: true
-        last_only: false
-
     training:
-        alignment_layer_name: "SAILStarMLP"
+        alignment_layer_name: "BridgeAnchorAlignmentLayer"
         alignment_layer_kwargs:
-            dim_alignment: 512
-            width_factor: 8
+            num_anchors: 64
 
         batch_size: 4096
 
@@ -31,6 +25,10 @@ overrides:
             structure_levels: 1
             structure_margin: 0.0
             structure_weighting: "none"
+
+    layer_selection:
+        best_only: true
+        last_only: false
 
     evaluation:
         zero_shot_datasets:
