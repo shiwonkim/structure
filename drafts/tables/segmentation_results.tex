@@ -1,0 +1,50 @@
+% tables/segmentation_results.tex
+% Zero-shot segmentation results (token-level alignment)
+% Encoders: DINOv2 ViT-L/14 + all-roberta-large-v1, COCO 2014 train.
+%
+% Usage: \input{tables/segmentation_results}
+
+\begin{table}[t]
+\centering
+\caption{%
+    \textbf{Zero-shot semantic segmentation on ViT-L/14 + RoBERTa-Large.}
+    All methods use ensemble text prompts (80 templates).
+    Reports mIoU (\%) on four benchmarks.
+    Best result per column in \textbf{bold}; second best \underline{underlined}.
+    Without alignment, direct cosine similarity yields $<$1\% mIoU on all benchmarks.
+}
+\label{tab:segmentation}
+\vspace{4pt}
+\begin{tabular}{l cccc}
+\toprule
+\textbf{Method} & VOC20 & Context & ADE20K & Stuff \\
+\midrule
+% --- Baselines ---
+Linear
+& 19.0 & 16.7 & 10.5 & -- \\
+Linear + STR
+& 21.2 & 19.5 & 11.5 & -- \\
+MLP
+& -- & -- & -- & -- \\
+MLP + STR
+& -- & -- & -- & -- \\
+FreezeAlign
+& 19.3 & 19.7 & 12.0 & -- \\
+FreezeAlign + STR
+& -- & -- & -- & -- \\
+\midrule
+% --- Ours ---
+BridgeAnchors (Ours)
+& 22.9 & 20.5 & 12.9 & -- \\
+BridgeAnchors (Ours)
+& \underline{25.6} & \underline{21.4} & \underline{14.0} & -- \\
+BridgeAnchors (Ours)
+& \textbf{27.1} & \textbf{22.4} & \textbf{15.2} & -- \\
+\bottomrule
+\end{tabular}
+\vspace{-4pt}
+\begin{flushleft}
+\footnotesize
+Blanks (--) indicate runs not yet completed. STR = STRUCTURE regularization~\citep{xxx}.
+\end{flushleft}
+\end{table}

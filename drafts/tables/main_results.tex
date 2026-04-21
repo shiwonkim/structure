@@ -1,0 +1,110 @@
+% tables/main_results.tex
+% Main results: Classification + Retrieval (token-level alignment)
+% Encoders: DINOv2 ViT-L/14 + all-roberta-large-v1, COCO 2014 train.
+%
+% Usage: \input{tables/main_results}
+
+\begin{table*}[t]
+\centering
+\caption{%
+    \textbf{Zero-shot classification and cross-modal retrieval on ViT-L/14 + RoBERTa-Large.}
+    All alignment methods operate on full token sequences (token-level);
+    CLS-only variants are reported in the appendix.
+    Classification reports top-1 accuracy (\%),
+    retrieval reports Recall@1 (\%) for image-to-text (I2T) and text-to-image (T2I).
+    Params denotes total learnable parameters (both modalities).
+    Best result per column in \textbf{bold}; second best \underline{underlined}.
+}
+\label{tab:main_results}
+\vspace{4pt}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{l r *{6}{c} *{4}{c}}
+\toprule
+& & \multicolumn{6}{c}{\textbf{Classification} (Acc)}
+& \multicolumn{4}{c}{\textbf{Retrieval} (R@1)} \\
+\cmidrule(lr){3-8} \cmidrule(lr){9-12}
+& & & & & & &
+& \multicolumn{2}{c}{Flickr30k}
+& \multicolumn{2}{c}{COCO} \\
+\cmidrule(lr){9-10} \cmidrule(lr){11-12}
+\textbf{Method}
+& \textbf{Params}
+& CIFAR-10 & CIFAR-100 & STL-10 & DTD & Flowers & GTSRB
+& I2T & T2I
+& I2T & T2I \\
+\midrule
+% --- Upper bound ---
+CLIP ViT-L/14\textsuperscript{$\dagger$}
+& --
+& -- & -- & -- & -- & -- & --
+& -- & --
+& -- & -- \\
+\midrule
+% --- Baselines ---
+Linear
+& 1.05M
+& -- & -- & -- & -- & -- & --
+& 63.8 & 50.3
+& 19.3 & 13.5 \\
+Linear + STR
+& 1.05M
+& -- & -- & -- & -- & -- & --
+& 66.2 & 49.6
+& 19.8 & 12.2 \\
+MLP
+& 1.25M
+& -- & -- & -- & -- & -- & --
+& 64.2 & 51.6
+& 19.4 & 13.5 \\
+MLP + STR
+& 1.25M
+& -- & -- & -- & -- & -- & --
+& -- & --
+& -- & -- \\
+FreezeAlign
+& 8.94M
+& -- & -- & -- & -- & -- & --
+& 62.9 & 48.9
+& 17.5 & 12.7 \\
+FreezeAlign + STR
+& 8.94M
+& -- & -- & -- & -- & -- & --
+& -- & --
+& -- & -- \\
+SAIL
+& --
+& -- & -- & -- & -- & -- & --
+& -- & --
+& -- & -- \\
+SAIL + STR
+& --
+& -- & -- & -- & -- & -- & --
+& -- & --
+& -- & -- \\
+\midrule
+% --- Ours ---
+BridgeAnchors (Ours)
+& 262K
+& -- & -- & -- & -- & -- & --
+& 69.2 & 54.8
+& 22.6 & 15.9 \\
+BridgeAnchors (Ours)
+& 524K
+& -- & -- & -- & -- & -- & --
+& 72.2 & 58.0
+& 25.3 & 17.4 \\
+BridgeAnchors (Ours)
+& 1.05M
+& -- & -- & -- & -- & -- & --
+& \textbf{75.5} & \textbf{60.2}
+& \textbf{27.4} & \textbf{18.6} \\
+\bottomrule
+\end{tabular}
+}
+\vspace{-4pt}
+\begin{flushleft}
+\footnotesize
+\textsuperscript{$\dagger$}CLIP ViT-L/14 is a jointly trained model (upper bound); all other methods are post-hoc alignment on frozen encoders. \\
+Blanks (--) indicate runs not yet completed. STR = STRUCTURE regularization~\citep{xxx}.
+\end{flushleft}
+\end{table*}

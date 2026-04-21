@@ -1,0 +1,51 @@
+% drafts/pseudocode_cap.tex
+% Pseudocode for Cross-Attention Pooling (CAP)
+% Requires: \usepackage{algorithm, algorithmic} or \usepackage{algorithm2e}
+%
+% Usage: \input{pseudocode_cap}
+
+% --- Option A: algorithm2e style (recommended for NeurIPS) ---
+
+\begin{algorithm}[t]
+\caption{Cross-Attention Pooling (CAP)}
+\label{alg:cap}
+\KwIn{Token sequence $\mathbf{Z} \in \mathbb{R}^{T \times D}$, \\
+\quad\quad learnable anchors $\mathbf{A} \in \mathbb{R}^{K \times D}$, \\
+\quad\quad pooling temperature $\tau_p$, \\
+\quad\quad optional padding mask $\mathbf{m} \in \{0,1\}^{T}$}
+\KwOut{Anchor profile $\mathbf{p} \in \mathbb{R}^{K}$ on the unit sphere}
+\BlankLine
+
+\tcp{Normalize tokens and anchors to unit sphere}
+$\hat{\mathbf{Z}} \leftarrow \mathrm{normalize}(\mathbf{Z}, \mathrm{dim}{=}\text{-}1)$ \hfill $\triangleright\; \hat{\mathbf{Z}} \in \mathbb{R}^{T \times D}$ \\
+$\hat{\mathbf{A}} \leftarrow \mathrm{normalize}(\mathbf{A}, \mathrm{dim}{=}\text{-}1)$ \hfill $\triangleright\; \hat{\mathbf{A}} \in \mathbb{R}^{K \times D}$ \\
+
+\BlankLine
+\tcp{Cosine similarity: each token vs.\ each anchor}
+$\mathbf{S} \leftarrow \hat{\mathbf{Z}} \, \hat{\mathbf{A}}^\top$ \hfill $\triangleright\; \mathbf{S} \in \mathbb{R}^{T \times K}$ \\
+
+\BlankLine
+\tcp{Temperature-scaled logits}
+$\mathbf{L} \leftarrow \mathbf{S} \;/\; \tau_p$ \hfill $\triangleright\; \mathbf{L} \in \mathbb{R}^{T \times K}$ \\
+
+\BlankLine
+\tcp{Mask padded positions (text)}
+\If{$\mathbf{m}$ is provided}{
+    $L_{tk} \leftarrow -\infty$ \quad where $m_t = 0$
+}
+
+\BlankLine
+\tcp{Softmax attention over tokens, per anchor}
+$\alpha_{tk} \leftarrow \dfrac{\exp(L_{tk})}{\sum_{t'=1}^{T} \exp(L_{t'k})}$ \hfill $\triangleright\; \boldsymbol{\alpha} \in \mathbb{R}^{T \times K}$ \\
+
+\BlankLine
+\tcp{Attention-weighted similarity profile}
+$p_k \leftarrow \displaystyle\sum_{t=1}^{T} \alpha_{tk} \cdot S_{tk}$ \quad for $k = 1, \ldots, K$ \hfill $\triangleright\; \mathbf{p} \in \mathbb{R}^{K}$ \\
+
+\BlankLine
+\tcp{Project to unit sphere}
+$\mathbf{p} \leftarrow \mathbf{p} \;/\; \|\mathbf{p}\|_2$ \\
+
+\BlankLine
+\Return{$\mathbf{p}$}
+\end{algorithm}

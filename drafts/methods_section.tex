@@ -1,0 +1,155 @@
+% =============================================================================
+% Methods Section — BridgeAnchors with Cross-Attention Pooling (CAP)
+% Draft for NeurIPS 2026 submission
+% =============================================================================
+
+\section{Method}
+\label{sec:method}
+
+We introduce \emph{BridgeAnchors} (BA), a lightweight cross-modal alignment method that maps frozen encoder representations into a shared space using learnable anchor points.  Our key contribution is \emph{Cross-Attention Pooling} (CAP), a token-level variant that exploits the full patch/token sequence from vision and language encoders rather than relying on a single pooled representation.  We first formalize the alignment problem (\cref{sec:problem}), then describe the CLS-level baseline (\cref{sec:cls_ba}) and the token-level CAP variant (\cref{sec:cap}).
+
+% -----------------------------------------------------------------------------
+\subsection{Problem Setup}
+\label{sec:problem}
+
+Let $f_v : \mathcal{X} \to \mathbb{R}^{D_v}$ and $f_l : \mathcal{Y} \to \mathbb{R}^{D_l}$ be pretrained, frozen vision and language encoders that map images and texts into $D_v$- and $D_l$-dimensional embedding spaces, respectively.  Given a dataset of $N$ paired observations $\{(x_i, y_i)\}_{i=1}^{N}$, the goal of \emph{post-hoc alignment} is to learn lightweight projection heads
+\begin{equation}
+    g_v : \mathbb{R}^{D_v} \to \mathbb{R}^{K}, \qquad
+    g_l : \mathbb{R}^{D_l} \to \mathbb{R}^{K},
+    \label{eq:projectors}
+\end{equation}
+that map both modalities into a shared $K$-dimensional space in which semantically matched pairs are close and unmatched pairs are far apart, \emph{without} modifying the encoder weights.
+
+\paragraph{Encoder outputs.}
+Modern vision encoders (e.g.\ DINOv2) produce a sequence of $T_v$ token embeddings per image, $\mathbf{Z}_v = [z_v^{\mathrm{cls}}; z_v^1; \ldots; z_v^{T_v - 1}] \in \mathbb{R}^{T_v \times D_v}$, where $z_v^{\mathrm{cls}}$ is the class token and the remaining $T_v - 1$ tokens correspond to spatial patches.  Similarly, language encoders yield $\mathbf{Z}_l = [z_l^1; \ldots; z_l^{T_l}] \in \mathbb{R}^{T_l \times D_l}$ with per-wordpiece token embeddings.  CLS-level methods discard the token sequences and operate only on a single pooled vector per sample: $\bar{z}_v = z_v^{\mathrm{cls}} \in \mathbb{R}^{D_v}$ for vision and $\bar{z}_l = \mathrm{pool}(\mathbf{Z}_l) \in \mathbb{R}^{D_l}$ for language (typically mean-pooling).
+
+\paragraph{Training objective.}
+All alignment heads in this work are trained with a symmetric InfoNCE (CLIP) loss.  For a mini-batch of $B$ aligned pairs, let $\mathbf{u}_i = g_v(\cdot)$ and $\mathbf{v}_i = g_l(\cdot)$ denote the $\ell_2$-normalized projections of the $i$-th image and text, respectively.  The loss is
+\begin{equation}
+    \mathcal{L}_{\mathrm{CLIP}} = \frac{1}{2}
+    \Bigg[
+        \frac{1}{B}\sum_{i=1}^{B} -\log \frac{\exp(\mathbf{u}_i^\top \mathbf{v}_i / \tau)}{\sum_{j=1}^{B} \exp(\mathbf{u}_i^\top \mathbf{v}_j / \tau)}
+        \;+\;
+        \frac{1}{B}\sum_{i=1}^{B} -\log \frac{\exp(\mathbf{v}_i^\top \mathbf{u}_i / \tau)}{\sum_{j=1}^{B} \exp(\mathbf{v}_i^\top \mathbf{u}_j / \tau)}
+    \Bigg],
+    \label{eq:clip_loss}
+\end{equation}
+where $\tau > 0$ is a temperature hyperparameter.
+
+% -----------------------------------------------------------------------------
+\subsection{CLS-Level BridgeAnchors}
+\label{sec:cls_ba}
+
+The simplest form of BridgeAnchors operates on the pooled CLS representation $\bar{z} \in \mathbb{R}^D$ from a single modality.  Each modality maintains a set of $K$ learnable \emph{anchor points} $\mathbf{A} = [\mathbf{a}_1; \ldots; \mathbf{a}_K] \in \mathbb{R}^{K \times D}$, initialized on the unit hypersphere $\|\mathbf{a}_k\|_2 = 1$.  The projection $g : \mathbb{R}^D \to \mathbb{R}^K$ computes the cosine similarity between the input and each anchor, yielding a $K$-dimensional \emph{anchor profile}:
+\begin{equation}
+    g(\bar{z}) = \mathrm{normalize}\!\left(
+        \left[\,
+            \frac{\bar{z}^\top \mathbf{a}_k}{\|\bar{z}\|_2 \|\mathbf{a}_k\|_2}
+        \,\right]_{k=1}^{K}
+    \right)
+    \;=\; \mathrm{normalize}\!\left(\hat{z} \cdot \hat{\mathbf{A}}^\top\right),
+    \label{eq:cls_profile}
+\end{equation}
+where $\hat{z} = \bar{z} / \|\bar{z}\|_2$, $\hat{\mathbf{A}}$ denotes the row-wise $\ell_2$-normalized anchor matrix, and $\mathrm{normalize}(\cdot)$ applies a final $\ell_2$ normalization to the output profile.
+
+The anchor profile $g(\bar{z}) \in \mathbb{R}^K$ can be interpreted as a soft \emph{codebook assignment}: each entry measures how well the input aligns with a particular anchor direction.  Two semantically similar inputs---even from different modalities---will produce similar profiles if their respective anchor sets learn complementary directions.
+
+\paragraph{Relation to linear projection.}  When $K = D_{\text{out}}$ and the anchors are unconstrained (no normalization), the CLS-level BA reduces to a linear mapping $\bar{z} \mapsto \bar{z} \cdot \mathbf{W}^\top$ followed by normalization, which is equivalent to the linear baseline up to the final normalization.  The anchor structure imposes an inductive bias toward \emph{directional} rather than \emph{magnitude-based} features, and empirically CLS BA performs comparably to Linear and MLP heads (\cref{sec:experiments}).
+
+% -----------------------------------------------------------------------------
+\subsection{Token-Level BridgeAnchors with Cross-Attention Pooling}
+\label{sec:cap}
+
+The CLS-level formulation discards the rich spatial (vision) and sequential (language) structure in the encoder's token outputs.  We now describe \emph{Cross-Attention Pooling} (CAP), which operates on the full token sequence $\mathbf{Z} \in \mathbb{R}^{T \times D}$ and uses the anchors as cross-attention queries over tokens.
+
+\subsubsection{Cross-Attention Pooling}
+
+Given a token sequence $\mathbf{Z} = [z^1; \ldots; z^T] \in \mathbb{R}^{T \times D}$ and the anchor matrix $\hat{\mathbf{A}} \in \mathbb{R}^{K \times D}$ (row-normalized), the CAP layer proceeds in three steps:
+
+\paragraph{Step 1: Anchor--token similarity.}
+Compute the cosine similarity between every anchor and every token:
+\begin{equation}
+    S_{tk} = \frac{z^t}{\|z^t\|_2} \cdot \frac{\mathbf{a}_k}{\|\mathbf{a}_k\|_2}
+    \;=\; \hat{z}^t \cdot \hat{\mathbf{a}}_k,
+    \qquad
+    \mathbf{S} \in \mathbb{R}^{T \times K}.
+    \label{eq:sim_matrix}
+\end{equation}
+
+\paragraph{Step 2: Softmax attention over tokens.}
+For each anchor $k$, compute a distribution over tokens via a temperature-scaled softmax along the token axis:
+\begin{equation}
+    \alpha_{tk} = \frac{\exp(S_{tk} / \tau_p)}{\sum_{t'=1}^{T} \exp(S_{t'k} / \tau_p)},
+    \qquad
+    \boldsymbol{\alpha}_k \in \Delta^{T-1},
+    \label{eq:attn_weights}
+\end{equation}
+where $\tau_p > 0$ is a pooling temperature (distinct from the contrastive loss temperature $\tau$).  Intuitively, $\boldsymbol{\alpha}_k$ identifies the subset of tokens most relevant to anchor $k$.  When an optional padding mask $\mathbf{m} \in \{0,1\}^T$ is provided (for variable-length text), masked positions are set to $-\infty$ before the softmax.
+
+\paragraph{Step 3: Attention-weighted profile.}
+The $k$-th entry of the output profile is the attention-weighted sum of the corresponding similarities:
+\begin{equation}
+    p_k = \sum_{t=1}^{T} \alpha_{tk} \cdot S_{tk},
+    \label{eq:profile_entry}
+\end{equation}
+and the final representation is the $\ell_2$-normalized profile vector:
+\begin{equation}
+    g_{\mathrm{CAP}}(\mathbf{Z}) = \mathrm{normalize}\!\left([p_1, \ldots, p_K]^\top\right) \in \mathbb{R}^K.
+    \label{eq:cap_output}
+\end{equation}
+
+Equivalently, in matrix notation:
+\begin{equation}
+    \mathbf{S} = \hat{\mathbf{Z}} \, \hat{\mathbf{A}}^\top, \qquad
+    \boldsymbol{\alpha} = \mathrm{softmax}(\mathbf{S} / \tau_p, \dim=\text{tokens}), \qquad
+    g_{\mathrm{CAP}}(\mathbf{Z}) = \mathrm{normalize}\!\left(\mathrm{diag}(\boldsymbol{\alpha}^\top \mathbf{S})\right),
+    \label{eq:cap_matrix}
+\end{equation}
+where the element-wise product $\boldsymbol{\alpha} \odot \mathbf{S}$ summed along the token axis yields the profile, i.e.\ $\mathbf{p} = (\boldsymbol{\alpha} \odot \mathbf{S})^\top \mathbf{1}_T$.
+
+\subsubsection{Interpretation as Cross-Attention}
+
+The CAP computation can be viewed as a single-head cross-attention where the $K$ anchors serve as queries, and the $T$ tokens serve as both keys and values:
+\begin{itemize}[leftmargin=*,nosep]
+    \item \textbf{Queries:} $\mathbf{Q} = \hat{\mathbf{A}} \in \mathbb{R}^{K \times D}$ (learnable anchors).
+    \item \textbf{Keys:} $\mathbf{K} = \hat{\mathbf{Z}} \in \mathbb{R}^{T \times D}$ (normalized tokens).
+    \item \textbf{Values:} The similarity scores $\mathbf{S}$ themselves, rather than separate value projections.
+\end{itemize}
+Unlike standard cross-attention, CAP shares the key and value computation (both derived from the same normalized token matrix) and omits learned projection matrices for $Q$, $K$, $V$.  The only learned parameters are the anchor vectors $\mathbf{A}$ themselves.  This makes CAP extremely parameter-efficient: the total parameter count is $K \times D$ per modality, independent of the number of tokens.
+
+\subsubsection{Why CAP Outperforms CLS Pooling}
+
+The CLS variant computes $g(\bar{z}) = \mathrm{normalize}(\hat{z} \cdot \hat{\mathbf{A}}^\top)$ where $\bar{z}$ is a single vector that must summarize the entire input.  Information about spatial layout (which patches depict which objects) and fine-grained token-level semantics is lost at the pooling stage of the encoder.
+
+CAP, by contrast, lets each anchor attend to different subsets of tokens.  Anchor $k$ may specialize in a particular visual concept or linguistic phrase, attending to the tokens most relevant to that concept.  The resulting profile $\mathbf{p}$ is a $K$-dimensional \emph{structured summary} that preserves which concepts are present and, via the attention pattern, where they appear.  This richer representation leads to substantially stronger retrieval and segmentation performance (\cref{sec:experiments}).
+
+\subsubsection{Optional CLS-Attention Prior}
+
+For vision encoders with a CLS self-attention mechanism (e.g.\ DINOv2), the CLS token's attention over patches provides a saliency signal that indicates globally important regions.  We optionally inject this prior into the CAP attention logits:
+\begin{equation}
+    S'_{tk} = \frac{S_{tk}}{\tau_p} + \beta_k \cdot \log(\mathrm{cls\_attn}_t + \epsilon),
+    \label{eq:cls_prior}
+\end{equation}
+where $\mathrm{cls\_attn}_t$ is the CLS token's attention weight on patch $t$, $\beta_k$ is a learnable per-anchor scalar, and $\epsilon$ is a small constant for numerical stability.  The modified logits $S'_{tk}$ replace $S_{tk}/\tau_p$ in \cref{eq:attn_weights}.  When $\beta_k \to 0$, the prior is ignored; when $\beta_k > 0$, anchors are softly steered toward patches deemed globally salient by the backbone.
+
+\subsubsection{Parameter Efficiency}
+
+\Cref{tab:param_count} summarizes the parameter count per modality for each alignment method.  BridgeAnchors (both CLS and CAP variants) require only $K \times D$ parameters, where $K$ is the number of anchors and $D$ is the encoder dimension.  For the default configuration ($K = 128$, $D = 1024$ for ViT-L), this amounts to 131K parameters---comparable to a linear projection and $\sim$12$\times$ fewer than FreezeAlign.
+
+\begin{table}[h]
+\centering
+\small
+\caption{Parameter count per modality for alignment methods (ViT-L/14, $D = 1024$).}
+\label{tab:param_count}
+\begin{tabular}{lcc}
+\toprule
+Method & Formula & Params \\
+\midrule
+Linear ($D_{\text{out}} = 512$) & $D \times D_{\text{out}}$ & 524K \\
+MLP / ResLowRank ($D_{\text{out}} = 512$, rank $64$) & $D \times D_{\text{out}} + 2 \times D \times r + D$ & 656K \\
+CLS BA ($K$ anchors) & $K \times D$ & $K \times 1024$ \\
+\textbf{Token BA / CAP} ($K$ anchors) & $K \times D$ & $K \times 1024$ \\
+FreezeAlign & $\sim 4 \times D \times D_{\text{emb}}$ & $\sim$4.5M \\
+\bottomrule
+\end{tabular}
+\end{table}
