@@ -27,13 +27,9 @@ Methods
                          (no alignment layer; baseline)
 2. ``freezealign``     — FreezeAlign ``local_vision_proj`` per-patch features
                          vs FreezeAlign full text forward
-3. ``anchor_codebook`` — BA-token: per-patch K-dim anchor similarity vector
-                         vs per-class CAP profile; both sides live in the
-                         anchor codebook
-4. ``attention_map``   — BA-token: per-anchor softmax attention over patches
-                         vs per-class CAP profile; image side is "where each
-                         anchor looks", text side is "which anchors each class
-                         activates"
+3. ``anchor_codebook`` — BA-token: softmax(sim/τ) per-patch anchor profile
+                         vs per-class CAP profile; τ defaults to training
+                         pool_temperature, overridable as ``anchor_codebook_0.03``
 
 Text strategies
 ---------------
@@ -47,7 +43,7 @@ Usage
         --checkpoint results/alignment-.../checkpoint-epochN.pth \\
         --layer-img 11 --layer-txt 6 \\
         --dataset voc2012 \\
-        --methods anchor_codebook,attention_map,direct_cosine \\
+        --methods anchor_codebook,direct_cosine \\
         --text-strategies raw,ensemble \\
         --gpu 0
 
@@ -491,20 +487,28 @@ class BAAnchorCodebookMethod(SegmentationMethod):
     """BridgeAnchors: each patch is encoded as a K-dim anchor-similarity
     vector; each class is encoded as a K-dim CAP profile. Both sides live
     in the same anchor codebook.
+
+    Applies softmax(sim / tau, dim=-1) to match the CAP attention
+    distribution used on the text side during training. Default tau is
+    the training pool_temperature; pass a different value for τ-sweep
+    ablations (dispatched as ``anchor_codebook_0.03``).
     """
     name = "anchor_codebook"
     pool_txt = "none"
 
-    def __init__(self, alignment_image, alignment_text):
+    def __init__(self, alignment_image, alignment_text, pool_temperature: float,
+                 inference_tau: float | None = None):
         self.alignment_image = alignment_image
         self.alignment_text = alignment_text
+        self.tau = inference_tau if inference_tau is not None else pool_temperature
 
     def get_patch_features(self, layer_feats, device):
         with torch.no_grad():
             z = layer_feats[1:, :].to(device)  # (P, D)
             z_n = F.normalize(z, dim=-1)
             a_n = F.normalize(self.alignment_image.anchors, dim=-1)  # (K, D)
-            return z_n @ a_n.T  # (P, K)
+            sim = z_n @ a_n.T  # (P, K)
+            return F.softmax(sim / self.tau, dim=-1)  # (P, K)
 
     def get_text_features(
         self, classnames, templates, tokenizer, language_model,
@@ -525,50 +529,6 @@ class BAAnchorCodebookMethod(SegmentationMethod):
             token_level=True,
         ).to(device)
 
-
-class BAAttentionMapMethod(SegmentationMethod):
-    """BridgeAnchors attention-map method: per-anchor softmax attention over
-    patches as the image descriptor. Interpretable as "anchor k attends to
-    patch t"; comparing with the class-side K-dim profile answers "class c
-    activates anchor k" and the product gives "patch t belongs to class c".
-
-    Uses the same temperature ``pool_temperature`` as training.
-    """
-    name = "attention_map"
-    pool_txt = "none"
-
-    def __init__(self, alignment_image, alignment_text, pool_temperature: float):
-        self.alignment_image = alignment_image
-        self.alignment_text = alignment_text
-        self.pool_temperature = pool_temperature
-
-    def get_patch_features(self, layer_feats, device):
-        with torch.no_grad():
-            z = layer_feats[1:, :].to(device)  # (P, D)
-            z_n = F.normalize(z, dim=-1)
-            a_n = F.normalize(self.alignment_image.anchors, dim=-1)  # (K, D)
-            sim = z_n @ a_n.T                                          # (P, K)
-            attn = F.softmax(sim / self.pool_temperature, dim=0)       # softmax over P
-            return attn  # (P, K)
-
-    def get_text_features(
-        self, classnames, templates, tokenizer, language_model,
-        layer_txt, device,
-    ):
-        return build_zero_shot_classifier(
-            language_model=language_model,
-            tokenizer=tokenizer,
-            classnames=classnames,
-            templates=templates,
-            dataset=None,
-            layer_index=layer_txt,
-            alignment_layer=self.alignment_text,
-            num_classes_per_batch=8,
-            device=device,
-            pool_txt="none",
-            save_path=None,
-            token_level=True,
-        ).to(device)
 
 
 class LinearPerPatchMethod(SegmentationMethod):
@@ -654,7 +614,7 @@ def build_vision_encoder(cfg: dict, device: torch.device):
     else:
         raise NotImplementedError(f"unknown vision model {lvm_model_name}")
     vision_model = create_feature_extractor(vision_model, return_nodes=return_nodes)
-    vision_model = vision_model.to(device).eval()
+    vision_model = vision_model.float().to(device).eval()
 
     image_transform = transforms.Compose([
         transforms.Lambda(_ensure_rgb_image),
@@ -672,7 +632,7 @@ def build_vision_encoder(cfg: dict, device: torch.device):
 def build_language_encoder(cfg: dict, device: torch.device):
     llm_model_name = cfg["alignment"]["llm_model_name"]
     tokenizer = load_tokenizer(llm_model_name)
-    language_model = load_llm(llm_model_name).to(device).eval()
+    language_model = load_llm(llm_model_name).float().to(device).eval()
     return language_model, tokenizer
 
 
@@ -1128,7 +1088,7 @@ def run_eval(
         layer_txt=layer_txt,
         device=device,
     )
-    text_feats = F.normalize(text_feats.to(device), dim=-1)
+    text_feats = F.normalize(text_feats.float().to(device), dim=-1)
 
     confusion = np.zeros(
         (dataset_spec.num_classes, dataset_spec.num_classes), dtype=np.int64,
@@ -1137,7 +1097,7 @@ def run_eval(
     n = len(dataset) if max_images is None else min(max_images, len(dataset))
     for i in tqdm(range(n), desc=f"{method.name}/{strategy}", leave=False):
         pil_img, pil_mask = dataset[i]
-        img_t = image_transform(pil_img).unsqueeze(0).to(device)  # (1,3,H,W)
+        img_t = image_transform(pil_img).unsqueeze(0).float().to(device)  # (1,3,H,W)
 
         with torch.no_grad():
             lvm_out = vision_model(img_t)
@@ -1145,7 +1105,7 @@ def run_eval(
             layer_key = list(lvm_out.keys())[layer_img]
             feats = lvm_out[layer_key].squeeze(0)  # (T, D)
 
-        patch_feats = method.get_patch_features(feats, device)  # (P, D_m)
+        patch_feats = method.get_patch_features(feats, device).float()  # (P, D_m)
         patch_feats = F.normalize(patch_feats, dim=-1)
         sim = patch_feats @ text_feats.T  # (P, C)
 
@@ -1224,24 +1184,23 @@ def build_method(
         return FreezeAlignMethod(
             alignment_image=alignment_image, alignment_text=alignment_text,
         )
-    if name == "anchor_codebook":
+    if name == "anchor_codebook" or name.startswith("anchor_codebook_"):
         if alignment_image is None:
             raise ValueError("anchor_codebook requires --checkpoint")
-        return BAAnchorCodebookMethod(
-            alignment_image=alignment_image, alignment_text=alignment_text,
-        )
-    if name == "attention_map":
-        if alignment_image is None:
-            raise ValueError("attention_map requires --checkpoint")
         pool_temperature = (
             cfg["training"]
             .get("alignment_layer_kwargs", {})
             .get("pool_temperature", 0.05)
         )
-        return BAAttentionMapMethod(
-            alignment_image=alignment_image,
-            alignment_text=alignment_text,
-            pool_temperature=pool_temperature,
+        inference_tau = None
+        if "_" in name[len("anchor_codebook"):]:
+            try:
+                inference_tau = float(name.split("_", 2)[-1])
+            except ValueError:
+                pass
+        return BAAnchorCodebookMethod(
+            alignment_image=alignment_image, alignment_text=alignment_text,
+            pool_temperature=pool_temperature, inference_tau=inference_tau,
         )
     if name == "linear_perpatch":
         if alignment_image is None:
@@ -1275,7 +1234,7 @@ def auto_filter_methods(
             keep.append(m)
         elif m == "freezealign" and is_fa:
             keep.append(m)
-        elif m in ("anchor_codebook", "attention_map") and is_ba:
+        elif (m == "anchor_codebook" or m.startswith("anchor_codebook_")) and is_ba:
             keep.append(m)
         elif m == "linear_perpatch" and is_linear_mlp:
             keep.append(m)
@@ -1316,7 +1275,7 @@ def main():
     parser.add_argument("--download", action="store_true")
     parser.add_argument(
         "--methods",
-        default="direct_cosine,freezealign,anchor_codebook,attention_map,linear_perpatch",
+        default="direct_cosine,freezealign,anchor_codebook,linear_perpatch",
         help="Comma-separated method names",
     )
     parser.add_argument(

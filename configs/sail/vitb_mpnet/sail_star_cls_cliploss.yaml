@@ -19,6 +19,7 @@ overrides:
         alignment_layer_kwargs:
             dim_alignment: 512
             width_factor: 8
+            concat_cls_patch: false
 
         batch_size: 4096
 
