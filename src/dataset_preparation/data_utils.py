@@ -268,12 +268,18 @@ def get_datasets(dataset, transform, root_dir: Union[str, Path] = "./data", **kw
         and https://vision.princeton.edu/projects/2010/SUN/download/Partitions.zip
         and move Training_0* / Testing_0* splits to unzipped SUN397 dir
         """
-        train_dataset = MySUN397(
-            root=data_path, partition=1, split="train", transform=transform
-        )
-        val_dataset = MySUN397(
-            root=data_path, partition=1, split="test", transform=transform
-        )
+        sun_test_dir = os.path.join(data_path, "sun397/test")
+        if os.path.isdir(sun_test_dir):
+            # HF-converted ImageFolder layout (no partition files needed)
+            val_dataset = dsets.ImageFolder(root=sun_test_dir, transform=transform)
+            train_dataset = val_dataset
+        else:
+            train_dataset = MySUN397(
+                root=data_path, partition=1, split="train", transform=transform
+            )
+            val_dataset = MySUN397(
+                root=data_path, partition=1, split="test", transform=transform
+            )
 
     elif dataset == "cars":
         """
@@ -353,8 +359,10 @@ def get_datasets(dataset, transform, root_dir: Union[str, Path] = "./data", **kw
         subset = []
         for t in np.unique(tmp_targets):
             np.random.seed(42)
+            n_avail = int((tmp_targets == t).sum())
+            n_train = min(30, n_avail)
             subset.extend(
-                np.random.choice(np.where(tmp_targets == t)[0], size=30, replace=False)
+                np.random.choice(np.where(tmp_targets == t)[0], size=n_train, replace=False)
             )
         subset_val = list(set([i for i in range(len(tmp_targets))]) - set(subset))
         train_dataset = Subset(tmp_dataset, subset)
