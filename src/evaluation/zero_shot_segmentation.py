@@ -27,9 +27,10 @@ Methods
                          (no alignment layer; baseline)
 2. ``freezealign``     — FreezeAlign ``local_vision_proj`` per-patch features
                          vs FreezeAlign full text forward
-3. ``anchor_codebook`` — BA-token: softmax(sim/τ) per-patch anchor profile
-                         vs per-class CAP profile; τ defaults to training
-                         pool_temperature, overridable as ``anchor_codebook_0.03``
+3. ``anchor_codebook`` — BA-token: raw cosine per-patch anchor similarity
+                         vs per-class CAP profile. Use ``anchor_codebook_softmax``
+                         for softmax(sim/τ) variant, ``anchor_codebook_softmax_0.03``
+                         for custom τ
 
 Text strategies
 ---------------
@@ -488,18 +489,20 @@ class BAAnchorCodebookMethod(SegmentationMethod):
     vector; each class is encoded as a K-dim CAP profile. Both sides live
     in the same anchor codebook.
 
-    Applies softmax(sim / tau, dim=-1) to match the CAP attention
-    distribution used on the text side during training. Default tau is
-    the training pool_temperature; pass a different value for τ-sweep
-    ablations (dispatched as ``anchor_codebook_0.03``).
+    Default uses raw cosine similarity (consistent across encoder scales).
+    Pass ``mode="softmax"`` for softmax(sim/τ, dim=-1), which helps ViT-S
+    but hurts ViT-B due to lower similarity variance in higher-D spaces.
+    Dispatch: ``anchor_codebook`` (raw), ``anchor_codebook_softmax``
+    (softmax with training τ), ``anchor_codebook_softmax_0.03`` (custom τ).
     """
     name = "anchor_codebook"
     pool_txt = "none"
 
     def __init__(self, alignment_image, alignment_text, pool_temperature: float,
-                 inference_tau: float | None = None):
+                 mode: str = "raw", inference_tau: float | None = None):
         self.alignment_image = alignment_image
         self.alignment_text = alignment_text
+        self.mode = mode
         self.tau = inference_tau if inference_tau is not None else pool_temperature
 
     def get_patch_features(self, layer_feats, device):
@@ -508,7 +511,9 @@ class BAAnchorCodebookMethod(SegmentationMethod):
             z_n = F.normalize(z, dim=-1)
             a_n = F.normalize(self.alignment_image.anchors, dim=-1)  # (K, D)
             sim = z_n @ a_n.T  # (P, K)
-            return F.softmax(sim / self.tau, dim=-1)  # (P, K)
+            if self.mode == "softmax":
+                return F.softmax(sim / self.tau, dim=-1)
+            return sim  # raw cosine similarity
 
     def get_text_features(
         self, classnames, templates, tokenizer, language_model,
@@ -1192,15 +1197,25 @@ def build_method(
             .get("alignment_layer_kwargs", {})
             .get("pool_temperature", 0.05)
         )
+        # Parse mode and optional tau from name:
+        #   anchor_codebook          → raw
+        #   anchor_codebook_softmax  → softmax with training τ
+        #   anchor_codebook_softmax_0.03 → softmax with τ=0.03
+        suffix = name[len("anchor_codebook"):]  # "" or "_softmax" or "_softmax_0.03"
+        mode = "raw"
         inference_tau = None
-        if "_" in name[len("anchor_codebook"):]:
-            try:
-                inference_tau = float(name.split("_", 2)[-1])
-            except ValueError:
-                pass
+        if "_softmax" in suffix:
+            mode = "softmax"
+            parts = suffix.split("_softmax")
+            if len(parts) > 1 and parts[1].startswith("_"):
+                try:
+                    inference_tau = float(parts[1][1:])
+                except ValueError:
+                    pass
         return BAAnchorCodebookMethod(
             alignment_image=alignment_image, alignment_text=alignment_text,
-            pool_temperature=pool_temperature, inference_tau=inference_tau,
+            pool_temperature=pool_temperature, mode=mode,
+            inference_tau=inference_tau,
         )
     if name == "linear_perpatch":
         if alignment_image is None:
