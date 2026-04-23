@@ -26,11 +26,10 @@ Methods
 1. ``direct_cosine``   — raw encoder patches vs raw text embeddings
                          (no alignment layer; baseline)
 2. ``freezealign``     — FreezeAlign ``local_vision_proj`` per-patch features
-                         vs FreezeAlign full text forward
-3. ``anchor_codebook`` — BA-token: raw cosine per-patch anchor similarity
-                         vs per-class CAP profile. Use ``anchor_codebook_softmax``
-                         for softmax(sim/τ) variant, ``anchor_codebook_softmax_0.03``
-                         for custom τ
+                         vs FreezeAlign full text forward (factorized decoding)
+3. ``anchor_codebook`` — BA-token: factorized S_pa @ S_ac decoding (default).
+                         ``anchor_codebook_raw`` for L2-normed direct cosine,
+                         ``anchor_codebook_softmax`` / ``_softmax_0.03`` for softmax
 
 Text strategies
 ---------------
@@ -383,6 +382,11 @@ class SegmentationMethod:
     #: ``"cls"`` if strict CLS is the natural text pooling; ``"avg"`` or
     #: ``"none"`` otherwise. Only consumed by the shared text path.
     pool_txt: str = "avg"
+    #: ``"direct"``  — L2-norm patch feats, then cosine with text (default).
+    #: ``"factorized"`` — raw S_pa @ S_ac with no per-patch L2-norm, making
+    #:   anchors an explicit semantic bridge: S_pc = S_pa @ S_ac where
+    #:   S_pa[p,k] = cos(patch_p, anchor_k), S_ac[k,c] = text_profile[c,k].
+    decoding: str = "direct"
 
     def get_patch_features(
         self, layer_feats: torch.Tensor, device: torch.device
@@ -447,9 +451,14 @@ class FreezeAlignMethod(SegmentationMethod):
 
     Text side uses the full trained FA text pipeline (``local_text_proj`` +
     ``text_proj``), identical to training.
+
+    Uses factorized decoding (no per-patch L2 norm) to match the original
+    FreezeAlign segmentation eval protocol: unnormalized projected patches
+    are compared against unit-norm text features via dot product.
     """
     name = "freezealign"
     pool_txt = "none"
+    decoding = "factorized"
 
     def __init__(self, alignment_image, alignment_text):
         self.alignment_image = alignment_image
@@ -489,31 +498,44 @@ class BAAnchorCodebookMethod(SegmentationMethod):
     vector; each class is encoded as a K-dim CAP profile. Both sides live
     in the same anchor codebook.
 
-    Default uses raw cosine similarity (consistent across encoder scales).
-    Pass ``mode="softmax"`` for softmax(sim/τ, dim=-1), which helps ViT-S
-    but hurts ViT-B due to lower similarity variance in higher-D spaces.
-    Dispatch: ``anchor_codebook`` (raw), ``anchor_codebook_softmax``
-    (softmax with training τ), ``anchor_codebook_softmax_0.03`` (custom τ).
+    Decoding modes (default: factorized):
+      ``factorized`` — raw S_pa @ S_ac with NO per-patch L2-norm, making
+                       anchors an explicit semantic bridge:
+                       S_pc[p,c] = Σ_k cos(patch_p, anchor_k) · profile[c,k]
+                       Consistent across encoder scales. Matches FA protocol.
+      ``raw``        — same S_pa but L2-normed before cosine (direct decoding)
+      ``softmax``    — softmax(S_pa/τ, dim=-1), L2-normed (direct decoding)
+
+    Dispatch: ``anchor_codebook`` (factorized), ``anchor_codebook_raw``,
+    ``anchor_codebook_softmax``, ``anchor_codebook_softmax_0.03``.
     """
     name = "anchor_codebook"
     pool_txt = "none"
 
     def __init__(self, alignment_image, alignment_text, pool_temperature: float,
-                 mode: str = "raw", inference_tau: float | None = None):
+                 mode: str = "factorized", inference_tau: float | None = None):
         self.alignment_image = alignment_image
         self.alignment_text = alignment_text
         self.mode = mode
         self.tau = inference_tau if inference_tau is not None else pool_temperature
+        self.decoding = "factorized" if mode == "factorized" else "direct"
 
     def get_patch_features(self, layer_feats, device):
         with torch.no_grad():
-            z = layer_feats[1:, :].to(device)  # (P, D)
-            z_n = F.normalize(z, dim=-1)
-            a_n = F.normalize(self.alignment_image.anchors, dim=-1)  # (K, D)
-            sim = z_n @ a_n.T  # (P, K)
+            z = layer_feats[1:, :].to(device)        # (P, D)
+            z_n = F.normalize(z, dim=-1)              # (P, D)
+            a_n = F.normalize(                        # (K, D)
+                self.alignment_image.anchors, dim=-1
+            )
+            S_pa = z_n @ a_n.T                        # (P, K)
+
+            P, K = S_pa.shape
+            D = z.shape[-1]
+            assert S_pa.shape == (P, K), f"S_pa shape {S_pa.shape} != ({P}, {K})"
+
             if self.mode == "softmax":
-                return F.softmax(sim / self.tau, dim=-1)
-            return sim  # raw cosine similarity
+                return F.softmax(S_pa / self.tau, dim=-1)  # (P, K)
+            return S_pa  # raw or factorized — both return raw S_pa
 
     def get_text_features(
         self, classnames, templates, tokenizer, language_model,
@@ -1111,8 +1133,21 @@ def run_eval(
             feats = lvm_out[layer_key].squeeze(0)  # (T, D)
 
         patch_feats = method.get_patch_features(feats, device).float()  # (P, D_m)
-        patch_feats = F.normalize(patch_feats, dim=-1)
-        sim = patch_feats @ text_feats.T  # (P, C)
+
+        decoding = getattr(method, "decoding", "direct")
+        if decoding == "factorized":
+            # Explicit anchor factorization: S_pc = S_pa @ S_ac
+            # S_pa: (P, K) raw cosine — no L2 norm
+            # S_ac: (K, C) = text_feats.T — text profiles transposed
+            S_pa = patch_feats                          # (P, K)
+            S_ac = text_feats.T                         # (K, C)
+            assert S_pa.shape[-1] == S_ac.shape[0], \
+                f"K mismatch: S_pa {S_pa.shape} vs S_ac {S_ac.shape}"
+            sim = S_pa @ S_ac                           # (P, C)
+        else:
+            # Direct decoding: L2-norm patch feats, cosine with text
+            patch_feats = F.normalize(patch_feats, dim=-1)
+            sim = patch_feats @ text_feats.T            # (P, C)
 
         P = sim.shape[0]
         h = int(round(math.sqrt(P)))
@@ -1198,13 +1233,16 @@ def build_method(
             .get("pool_temperature", 0.05)
         )
         # Parse mode and optional tau from name:
-        #   anchor_codebook          → raw
-        #   anchor_codebook_softmax  → softmax with training τ
-        #   anchor_codebook_softmax_0.03 → softmax with τ=0.03
-        suffix = name[len("anchor_codebook"):]  # "" or "_softmax" or "_softmax_0.03"
-        mode = "raw"
+        #   anchor_codebook              → raw (direct decoding)
+        #   anchor_codebook_softmax      → softmax with training τ
+        #   anchor_codebook_softmax_0.03 → softmax with custom τ
+        #   anchor_codebook_factorized   → factorized S_pa @ S_ac
+        suffix = name[len("anchor_codebook"):]
+        mode = "factorized"  # default
         inference_tau = None
-        if "_softmax" in suffix:
+        if "_raw" in suffix:
+            mode = "raw"
+        elif "_softmax" in suffix:
             mode = "softmax"
             parts = suffix.split("_softmax")
             if len(parts) > 1 and parts[1].startswith("_"):
