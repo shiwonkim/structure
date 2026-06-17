@@ -32,10 +32,11 @@ overrides:
 
     evaluation:
         zero_shot_datasets:
-            - "cifar10"
             - "stl10"
             - "cifar100"
-            - "mnist"
+            - "caltech101"
+            - "dtd"
+            - "eurosat"
         retrieval_datasets:
             - "flickr30"
-            - "coco"
+            - "coco_karpathy"

@@ -20,7 +20,7 @@ overrides:
         alignment_layer_name: "BridgeAnchorTokenAlignmentLayer"
         alignment_layer_kwargs:
             num_anchors: 512
-            pool_temperature: 0.05
+            pool_temperature: 0.03
             projector_dim: 0
 
         batch_size: 4096
@@ -41,10 +41,11 @@ overrides:
     evaluation:
         token_level_zero_shot: true
         zero_shot_datasets:
-            - "cifar10"
             - "stl10"
             - "cifar100"
-            - "mnist"
+            - "caltech101"
+            - "dtd"
+            - "eurosat"
         retrieval_datasets:
             - "flickr30"
-            - "coco"
+            - "coco_karpathy"

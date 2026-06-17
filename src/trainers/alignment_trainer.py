@@ -1597,6 +1597,20 @@ class AlignmentTrainer(Trainer):
                 #     != full 591K -> dedup silently skipped on image only,
                 #     still applied to the still-full text + mask tensors
 
+                # Apply fit-time subsampling to token features (mirrors
+                # the CLS-level subsampling done earlier in fit()).
+                if token_subsample_train_idx is not None:
+                    n_tok = layer_image_features_train.shape[0]
+                    valid = token_subsample_train_idx[token_subsample_train_idx < n_tok]
+                    if len(valid) < n_tok:
+                        logger.debug(
+                            f"Subsampling token train: {n_tok} -> {len(valid)}"
+                        )
+                        layer_image_features_train = layer_image_features_train[valid]
+                        layer_text_features_train = layer_text_features_train[valid]
+                        if layer_text_mask_train is not None:
+                            layer_text_mask_train = layer_text_mask_train[valid]
+
                 logger.debug(
                     f"TOKEN TRAIN - img: {tuple(layer_image_features_train.shape)}, "
                     f"txt: {tuple(layer_text_features_train.shape)}, "
@@ -1803,6 +1817,13 @@ class AlignmentTrainer(Trainer):
             logger.info(
                 f"Training alignment for layers {layer_comb} (score: {layer_comb_score:.4f})"
             )
+
+            # Recompute input_dim from the actual features that will be
+            # trained on. The CLS stubs used when token_level=True have
+            # shape (N, 1), so image_dim/text_dim set earlier would be 1
+            # instead of the real embedding dimension.
+            image_dim = layer_image_features_train.shape[-1]
+            text_dim = layer_text_features_train.shape[-1]
 
             # define the loss function
             loss_name = self.config["training"].get("clip_loss_name", "CLIPLoss")
@@ -2685,7 +2706,7 @@ class AlignmentTrainer(Trainer):
                     else:
                         raise ValueError(f"Unknown length of batch: {len(batch)}")
 
-                    images = images.to(self.device, non_blocking=True)
+                    images = images.to(self.device, non_blocking=True).float()
                     lvm_output = vision_model(images)
                     if token_level_zero_shot:
                         # Token-mode: keep the full token sequence for the

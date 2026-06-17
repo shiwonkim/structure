@@ -458,11 +458,11 @@ class FreezeAlignMethod(SegmentationMethod):
     """
     name = "freezealign"
     pool_txt = "none"
-    decoding = "factorized"
 
-    def __init__(self, alignment_image, alignment_text):
+    def __init__(self, alignment_image, alignment_text, decoding: str = "factorized"):
         self.alignment_image = alignment_image
         self.alignment_text = alignment_text
+        self.decoding = decoding
 
     def get_patch_features(self, layer_feats, device):
         with torch.no_grad():
@@ -541,6 +541,8 @@ class BAAnchorCodebookMethod(SegmentationMethod):
         self, classnames, templates, tokenizer, language_model,
         layer_txt, device,
     ):
+        # CLS BA (BridgeAnchorAlignmentLayer) doesn't accept mask/token input.
+        is_cls_ba = type(self.alignment_text).__name__ == "BridgeAnchorAlignmentLayer"
         return build_zero_shot_classifier(
             language_model=language_model,
             tokenizer=tokenizer,
@@ -551,9 +553,9 @@ class BAAnchorCodebookMethod(SegmentationMethod):
             alignment_layer=self.alignment_text,
             num_classes_per_batch=8,
             device=device,
-            pool_txt="none",
+            pool_txt="avg" if is_cls_ba else "none",
             save_path=None,
-            token_level=True,
+            token_level=not is_cls_ba,
         ).to(device)
 
 
@@ -572,9 +574,10 @@ class LinearPerPatchMethod(SegmentationMethod):
     name = "linear_perpatch"
     pool_txt = "none"
 
-    def __init__(self, alignment_image, alignment_text):
+    def __init__(self, alignment_image, alignment_text, decoding: str = "direct"):
         self.alignment_image = alignment_image
         self.alignment_text = alignment_text
+        self.decoding = decoding
 
     def get_patch_features(self, layer_feats, device):
         with torch.no_grad():
@@ -589,6 +592,14 @@ class LinearPerPatchMethod(SegmentationMethod):
                 return z0 + ai.alpha * delta  # (P, D_out)
             elif cls_name == "MLPAlignmentLayer":
                 return self.alignment_image.mlp(patches)  # (P, D_out)
+            elif cls_name == "SAILStarMLP":
+                ai = self.alignment_image
+                if getattr(ai, "concat_cls_patch", False):
+                    cls_token = layer_feats[0, :].to(device)  # (D,)
+                    cls_expanded = cls_token.unsqueeze(0).expand(patches.shape[0], -1)  # (P, D)
+                    patches_cat = torch.cat([cls_expanded, patches], dim=-1)  # (P, 2D)
+                    return ai._star_forward(patches_cat, ai.image_mlp)
+                return ai._star_forward(patches, ai.image_mlp)  # (P, D_out)
             else:
                 raise ValueError(
                     f"linear_perpatch not supported for {cls_name}"
@@ -1213,7 +1224,8 @@ def save_per_class_csv(
 # ------------------------------------------------------------------
 
 def build_method(
-    name: str, alignment_image, alignment_text, cfg: dict
+    name: str, alignment_image, alignment_text, cfg: dict,
+    decoding_override: str | None = None,
 ) -> SegmentationMethod:
     pool_txt = cfg["features"].get("pool_txt", "avg")
     if name == "direct_cosine":
@@ -1221,8 +1233,10 @@ def build_method(
     if name == "freezealign":
         if alignment_image is None:
             raise ValueError("freezealign method requires --checkpoint")
+        dec = decoding_override if decoding_override else "factorized"
         return FreezeAlignMethod(
             alignment_image=alignment_image, alignment_text=alignment_text,
+            decoding=dec,
         )
     if name == "anchor_codebook" or name.startswith("anchor_codebook_"):
         if alignment_image is None:
@@ -1250,6 +1264,8 @@ def build_method(
                     inference_tau = float(parts[1][1:])
                 except ValueError:
                     pass
+        if decoding_override:
+            mode = decoding_override
         return BAAnchorCodebookMethod(
             alignment_image=alignment_image, alignment_text=alignment_text,
             pool_temperature=pool_temperature, mode=mode,
@@ -1258,8 +1274,10 @@ def build_method(
     if name == "linear_perpatch":
         if alignment_image is None:
             raise ValueError("linear_perpatch requires --checkpoint")
+        dec = decoding_override if decoding_override else "direct"
         return LinearPerPatchMethod(
             alignment_image=alignment_image, alignment_text=alignment_text,
+            decoding=dec,
         )
     raise ValueError(f"unknown method {name!r}")
 
@@ -1280,7 +1298,7 @@ def auto_filter_methods(
     layer_cls = type(alignment_image).__name__
     is_ba = "BridgeAnchor" in layer_cls
     is_fa = "FreezeAlign" in layer_cls
-    is_linear_mlp = layer_cls in ("LinearAlignmentLayer", "ResLowRankHead", "MLPAlignmentLayer")
+    is_linear_mlp = layer_cls in ("LinearAlignmentLayer", "ResLowRankHead", "MLPAlignmentLayer", "SAILStarMLP")
     keep = []
     for m in requested:
         if m == "direct_cosine":
@@ -1341,6 +1359,10 @@ def main():
         help="Optional cap on val set size for quick smoke tests",
     )
     parser.add_argument(
+        "--decoding", default=None, choices=["direct", "factorized"],
+        help="Override decoding mode for all methods (default: method-specific)",
+    )
+    parser.add_argument(
         "--output-csv",
         default=None,
         help="Per-class IoU CSV output path (default: <dataset>_seg_iou.csv next to ckpt)",
@@ -1397,7 +1419,8 @@ def main():
     # Run each method × strategy combination
     results = []
     for method_name in methods:
-        method = build_method(method_name, alignment_image, alignment_text, cfg)
+        method = build_method(method_name, alignment_image, alignment_text, cfg,
+                              decoding_override=args.decoding)
         for strategy in strategies:
             logger.info(f"==> {method_name} / {strategy}")
             res = run_eval(

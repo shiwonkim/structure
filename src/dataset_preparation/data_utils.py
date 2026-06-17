@@ -476,16 +476,19 @@ def get_datasets(dataset, transform, root_dir: Union[str, Path] = "./data", **kw
         )
 
     elif dataset == "pcam":
-        tmp_dataset1 = dsets.PCAM(
-            root=data_path, split="train", transform=transform, download=True
-        )
-        tmp_dataset2 = dsets.PCAM(
-            root=data_path, split="val", transform=transform, download=True
-        )
-        train_dataset = ConcatDataset((tmp_dataset1, tmp_dataset2))
         val_dataset = dsets.PCAM(
-            root=data_path, split="test", transform=transform, download=True
+            root=data_path, split="test", transform=transform, download=False
         )
+        try:
+            tmp_dataset1 = dsets.PCAM(
+                root=data_path, split="train", transform=transform, download=False
+            )
+            tmp_dataset2 = dsets.PCAM(
+                root=data_path, split="val", transform=transform, download=False
+            )
+            train_dataset = ConcatDataset((tmp_dataset1, tmp_dataset2))
+        except (FileNotFoundError, RuntimeError):
+            train_dataset = val_dataset
 
     elif dataset == "ucf101":
         """
@@ -597,6 +600,42 @@ def get_datasets(dataset, transform, root_dir: Union[str, Path] = "./data", **kw
             d.mapping_class_to_number = mapping_class_to_number
             d.mapping_number_to_class = mapping_number_to_class
             d.classes = [d.class_mapping_dict.get(x) for x in d.classes]
+
+    elif dataset == "coco2017":
+        coco17_path = Path("/home/data/2026_COCO")
+        coco14_path = Path(data_path) / "COCO"
+
+        train_dataset = CocoCaptionDataset(
+            annotation_file=coco17_path / "annotations" / "captions_train2017.json",
+            image_dir=coco17_path / "train2017",
+            transform=transform,
+            **kwargs,
+        )
+
+        # Filter out Karpathy test IDs to avoid train/test overlap
+        karpathy_ids_path = coco14_path / "karpathy_test_ids.json"
+        if karpathy_ids_path.exists():
+            import json as _json
+            with open(karpathy_ids_path) as _f:
+                karpathy_test_ids = set(_json.load(_f))
+            before = len(train_dataset.df)
+            keep = train_dataset.df["image_path"].apply(
+                lambda p: int(os.path.basename(p).split(".")[0]) not in karpathy_test_ids
+            )
+            train_dataset.df = train_dataset.df[keep].reset_index(drop=True)
+            logger.info(
+                f"COCO 2017 filtered: {before} -> {len(train_dataset.df)} "
+                f"(removed {before - len(train_dataset.df)} Karpathy test overlaps)"
+            )
+
+        val_dataset = CocoCaptionDataset(
+            annotation_file=coco17_path / "annotations" / "captions_val2017.json",
+            image_dir=coco17_path / "val2017",
+            transform=transform,
+            **kwargs,
+        )
+        train_dataset.name = "coco2017"
+        val_dataset.name = "coco2017"
 
     elif dataset in ("coco", "coco_karpathy"):
         coco_path = Path(data_path) / "COCO"

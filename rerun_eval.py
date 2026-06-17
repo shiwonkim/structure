@@ -51,6 +51,9 @@ def main():
     p.add_argument("--rt", default="", help="Comma-separated retrieval datasets")
     p.add_argument("--img_layer", type=int, default=11)
     p.add_argument("--txt_layer", type=int, default=6)
+    p.add_argument("--token_level_zs", type=str, default=None,
+                   choices=["true", "false"],
+                   help="Override token_level_zero_shot (default: use config)")
     args = p.parse_args()
 
     cfg_path = Path(args.config_path)
@@ -62,6 +65,11 @@ def main():
     rt_list = [x.strip() for x in args.rt.split(",") if x.strip()]
     cfg["evaluation"]["zero_shot_datasets"] = zs_list
     cfg["evaluation"]["retrieval_datasets"] = rt_list
+
+    if args.token_level_zs is not None:
+        override = args.token_level_zs == "true"
+        cfg["evaluation"]["token_level_zero_shot"] = override
+        cfg["training"]["token_level"] = override
 
     # Disable wandb via env (we still need a real offline run because
     # base_trainer reads wandb.run.dir at __init__ time)

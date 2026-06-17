@@ -1,15 +1,16 @@
 defaults: !include ../../default.yaml
 
 overrides:
-    # BA K=512 with SigLipLoss instead of CLIPLoss — loss ablation.
     alignment:
-        llm_model_name: "sentence-transformers/all-MiniLM-L6-v2"
-        lvm_model_name: "vit_small_patch14_dinov2.lvd142m"
+        llm_model_name: "sentence-transformers/all-roberta-large-v1"
+        lvm_model_name: "vit_large_patch14_dinov2.lvd142m"
 
     features:
-        dataset: "coco"
+        dataset: "coco2017"
         batch_size: 64
         num_workers: 4
+        layer_img: 23
+        layer_txt: 24
 
     layer_selection:
         best_only: true
@@ -21,12 +22,12 @@ overrides:
         alignment_layer_name: "BridgeAnchorTokenAlignmentLayer"
         alignment_layer_kwargs:
             num_anchors: 512
-            pool_temperature: 0.05
+            pool_temperature: 0.03
             projector_dim: 0
 
         batch_size: 4096
 
-        clip_loss_name: "SigLipLoss"
+        clip_loss_name: "CLIPLoss"
         clip_loss:
             temperature: 0.05
             normalize_latents: true
@@ -36,16 +37,14 @@ overrides:
             structure_margin: 0.0
             structure_weighting: "none"
 
-        visualize_original_embeddings: false
-        log_structural_preservation: false
-
     evaluation:
         token_level_zero_shot: true
         zero_shot_datasets:
-            - "cifar10"
             - "stl10"
             - "cifar100"
-            - "mnist"
+            - "caltech101"
+            - "dtd"
+            - "eurosat"
         retrieval_datasets:
             - "flickr30"
             - "coco_karpathy"

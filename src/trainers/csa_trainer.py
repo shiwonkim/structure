@@ -364,7 +364,7 @@ class CSATrainer(AlignmentTrainer):
                     else:
                         raise ValueError(f"Unknown length of batch: {len(batch)}")
 
-                    images = images.to(self.device, non_blocking=True)
+                    images = images.to(self.device, non_blocking=True).float()
                     lvm_output = vision_model(images)
                     if self.config["features"]["pool_img"] == "cls":
                         # extract the class token for all layers

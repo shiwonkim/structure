@@ -39,7 +39,7 @@ def load_dataset(
         root_dir=data_path,
     )
 
-    if dataset_name != "coco" and dataset_name != "flickr30":
+    if dataset_name not in ("coco", "coco2017", "flickr30"):
         train_dataset = ImageTextDataset(
             dataset=train_dataset,
             label_templates=label_templates,
