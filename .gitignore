@@ -300,3 +300,6 @@ logs/
 .claude/
 bridge-anchors/
 archive/
+docs/
+drafts/
+_oneoff/

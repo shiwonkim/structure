@@ -9,6 +9,8 @@ overrides:
         dataset: "coco"
         batch_size: 64
         num_workers: 0
+        layer_img: 23
+        layer_txt: 24
 
     layer_selection:
         best_only: true
@@ -41,10 +43,12 @@ overrides:
     evaluation:
         token_level_zero_shot: true
         zero_shot_datasets:
-            - "cifar10"
             - "stl10"
+            - "cifar10"
             - "cifar100"
-            - "mnist"
+            - "imagenet"
+            - "dtd"
+            - "eurosat"
         retrieval_datasets:
             - "flickr30"
-            - "coco"
+            - "coco_karpathy"

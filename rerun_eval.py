@@ -12,6 +12,7 @@ Usage:
 """
 import argparse
 import os
+import re
 from pathlib import Path
 
 import torch
@@ -49,9 +50,26 @@ def main():
     p.add_argument("--label", required=True, help="Run label for log output")
     p.add_argument("--zs", default="", help="Comma-separated zero-shot datasets")
     p.add_argument("--rt", default="", help="Comma-separated retrieval datasets")
-    p.add_argument("--img_layer", type=int, default=11)
-    p.add_argument("--txt_layer", type=int, default=6)
+    p.add_argument("--img_layer", type=int, default=None,
+                   help="Image layer index (auto-detected from ckpt path if omitted)")
+    p.add_argument("--txt_layer", type=int, default=None,
+                   help="Text layer index (auto-detected from ckpt path if omitted)")
     args = p.parse_args()
+
+    # Auto-detect layer indices from checkpoint path, e.g. "(23, 24)_0.2903"
+    if args.img_layer is None or args.txt_layer is None:
+        m = re.search(r'\((\d+),\s*(\d+)\)', args.ckpt)
+        if m:
+            if args.img_layer is None:
+                args.img_layer = int(m.group(1))
+            if args.txt_layer is None:
+                args.txt_layer = int(m.group(2))
+            logger.info(f"Auto-detected layers from ckpt path: img={args.img_layer}, txt={args.txt_layer}")
+        else:
+            raise ValueError(
+                "Cannot auto-detect layer indices from checkpoint path. "
+                "Please specify --img_layer and --txt_layer explicitly."
+            )
 
     cfg_path = Path(args.config_path)
     with open(cfg_path) as f:
@@ -166,6 +184,7 @@ def main():
     alignment_text = ckpt["alignment_text"].to(trainer.device)
     alignment_image.eval()
     alignment_text.eval()
+
     if hasattr(alignment_image, "set_modality"):
         alignment_image.set_modality("image")
     if hasattr(alignment_text, "set_modality"):

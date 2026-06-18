@@ -9,6 +9,16 @@ overrides:
         dataset: "coco"
         batch_size: 64
         num_workers: 0
+        layer_img: 23
+        layer_txt: 24
+
+        # Additional LAION features for data scaling (memmap, disk-backed)
+        add_img_feat_paths:
+            - "results/features/laion/laion_image_tokens.npy"
+        add_txt_feat_paths:
+            - "results/features/laion/laion_text_tokens.npy"
+        add_txt_mask_path: "results/features/laion/laion_text_mask.npy"
+        add_meta_path: "results/features/laion/laion_meta.pt"
 
     layer_selection:
         best_only: true
@@ -19,8 +29,8 @@ overrides:
 
         alignment_layer_name: "BridgeAnchorTokenAlignmentLayer"
         alignment_layer_kwargs:
-            num_anchors: 32
-            pool_temperature: 0.05
+            num_anchors: 512
+            pool_temperature: 0.03
             projector_dim: 0
 
         batch_size: 4096
@@ -41,10 +51,11 @@ overrides:
     evaluation:
         token_level_zero_shot: true
         zero_shot_datasets:
-            - "cifar10"
             - "stl10"
+            - "cifar10"
             - "cifar100"
-            - "mnist"
+            - "dtd"
+            - "eurosat"
         retrieval_datasets:
             - "flickr30"
-            - "coco"
+            - "coco_karpathy"

@@ -56,6 +56,29 @@ from src.utils.utils import (
 )
 
 
+def _torch_load_shared_mmap(path):
+    """``torch.load(mmap=True)`` with MAP_SHARED instead of MAP_PRIVATE.
+
+    PyTorch 2.1's mmap path calls ``UntypedStorage.from_file(f, False, size)``
+    — the ``False`` means MAP_PRIVATE, which counts against the kernel's
+    CommitLimit (swap + overcommit_ratio% × RAM ≈ 130 GB on Server B).
+    A single ViT-L text-token cache is 156 GB, already over CommitLimit,
+    and two concurrent processes are impossible.
+
+    MAP_SHARED file-backed mappings do *not* count against Committed_AS and
+    the OS page-cache automatically deduplicates physical pages across
+    processes.  This is safe because feature caches are never modified
+    in-place: all downstream consumers index-copy (``tensor[mask]``) or
+    ``.float().to(device)``.
+    """
+    _orig = torch.UntypedStorage.from_file
+    torch.UntypedStorage.from_file = lambda f, shared, size: _orig(f, True, size)
+    try:
+        return torch.load(str(path), weights_only=False, mmap=True)
+    finally:
+        torch.UntypedStorage.from_file = _orig
+
+
 class AlignmentTrainer(Trainer):
     def __init__(
         self,
@@ -188,13 +211,7 @@ class AlignmentTrainer(Trainer):
         )
 
         if save_path.exists():
-            # mmap=True: feature cache is file-backed, pages shared via
-            # OS page cache between concurrent training processes. Drops
-            # per-process Committed_AS by ~50–100 GB on ViT-L/RoBERTa-L
-            # runs and avoids blowing Server B's CommitLimit of ~136 GB.
-            llm_feats = torch.load(
-                str(save_path), weights_only=False, mmap=True
-            )["features"]
+            llm_feats = _torch_load_shared_mmap(save_path)["features"]
             logger.debug(f"Loaded features from: {save_path}")
             return llm_feats
 
@@ -299,10 +316,7 @@ class AlignmentTrainer(Trainer):
         )
 
         if save_path.exists():
-            # mmap=True: see get_text_features cache load for rationale.
-            lvm_feats = torch.load(
-                str(save_path), weights_only=False, mmap=True
-            )["features"]
+            lvm_feats = _torch_load_shared_mmap(save_path)["features"]
             logger.debug(f"Loaded features from: {save_path}")
             return lvm_feats
 
@@ -1147,8 +1161,7 @@ class AlignmentTrainer(Trainer):
         )
         if not path.exists():
             return None
-        payload = torch.load(path, weights_only=False)
-        feats = payload["features"]
+        feats = _torch_load_shared_mmap(path)["features"]
         # tokens[:, 0, :] is the CLS token under DINOv2's standard layout.
         cls = feats[:, 0, :].contiguous()
         logger.debug(
@@ -1166,8 +1179,8 @@ class AlignmentTrainer(Trainer):
         )
         if not (feats_path.exists() and mask_path.exists()):
             return None
-        feats = torch.load(feats_path, weights_only=False)["features"]
-        mask = torch.load(mask_path, weights_only=False)["mask"]
+        feats = _torch_load_shared_mmap(feats_path)["features"]
+        mask = _torch_load_shared_mmap(mask_path)["mask"]
         # masked mean over the sequence axis: (feats * mask).sum(1) / mask.sum(1)
         m = mask.to(dtype=feats.dtype).unsqueeze(-1)
         denom = m.sum(dim=1).clamp(min=1)
@@ -1597,6 +1610,20 @@ class AlignmentTrainer(Trainer):
                 #     != full 591K -> dedup silently skipped on image only,
                 #     still applied to the still-full text + mask tensors
 
+                # Apply fit-time subsampling to token features (mirrors
+                # the CLS-level subsampling done earlier in fit()).
+                if token_subsample_train_idx is not None:
+                    n_tok = layer_image_features_train.shape[0]
+                    valid = token_subsample_train_idx[token_subsample_train_idx < n_tok]
+                    if len(valid) < n_tok:
+                        logger.debug(
+                            f"Subsampling token train: {n_tok} -> {len(valid)}"
+                        )
+                        layer_image_features_train = layer_image_features_train[valid]
+                        layer_text_features_train = layer_text_features_train[valid]
+                        if layer_text_mask_train is not None:
+                            layer_text_mask_train = layer_text_mask_train[valid]
+
                 logger.debug(
                     f"TOKEN TRAIN - img: {tuple(layer_image_features_train.shape)}, "
                     f"txt: {tuple(layer_text_features_train.shape)}, "
@@ -1707,62 +1734,187 @@ class AlignmentTrainer(Trainer):
                 if additional_text_features is not None:
                     del additional_text_features
 
-            l_add_img_feats = []
-            for add_img_feat_paths in self.config["features"].get(
-                "add_img_feat_paths", []
-            ):
-                if Path(add_img_feat_paths).exists():
-                    add_img_feats = torch.load(add_img_feat_paths, weights_only=False)[
-                        "image_feats"
-                    ]
-                    l_add_img_feats.append(add_img_feats)
-                    logger.debug(f"Loaded features from: {add_img_feat_paths}")
-            if len(l_add_img_feats) > 1:
-                l_add_img_feats = torch.cat(l_add_img_feats, dim=0)
+            # Load additional features — supports both torch .pt files
+            # (loaded into RAM) and numpy memmap .npy files (disk-backed,
+            # only the accessed batch is paged into RAM by the OS).
+            add_img_path = (self.config["features"].get("add_img_feat_paths") or [None])[0]
+            add_txt_path = (self.config["features"].get("add_txt_feat_paths") or [None])[0]
+            add_txt_mask_path = self.config["features"].get("add_txt_mask_path")
+            add_meta_path = self.config["features"].get("add_meta_path")
 
-            l_add_txt_feats = []
-            for add_txt_feat_paths in self.config["features"].get(
-                "add_txt_feat_paths", []
-            ):
-                if Path(add_txt_feat_paths).exists():
-                    add_txt_feats = torch.load(add_txt_feat_paths, weights_only=False)[
-                        "text_feats"
-                    ]
-                    l_add_txt_feats.append(add_txt_feats)
-                    logger.debug(f"Loaded features from: {add_txt_feat_paths}")
-            if len(l_add_txt_feats) > 1:
-                l_add_txt_feats = torch.cat(l_add_txt_feats, dim=0)
+            has_additional = (
+                add_img_path and Path(add_img_path).exists()
+                and add_txt_path and Path(add_txt_path).exists()
+            )
 
-            if n_random_additional_feats == 0:
-                del l_add_img_feats, l_add_txt_feats
-            else:
-                if (
-                    n_random_additional_feats is not None
-                    and n_random_additional_feats < l_add_img_feats.shape[0]
-                ):
-                    logger.debug(f"Subsampling LAION to {n_random_additional_feats}")
-                    wandb.run.tags = wandb.run.tags + (
-                        f"LAION subsample {n_random_additional_feats}",
-                    )
-                    random_sequence = torch.randperm(l_add_img_feats.shape[0])[
-                        :n_random_additional_feats
-                    ]
-                    l_add_img_feats = l_add_img_feats[random_sequence]
-                    l_add_txt_feats = l_add_txt_feats[random_sequence]
-                if len(l_add_img_feats) > 1:
-                    layer_image_features_train = torch.cat(
-                        (layer_image_features_train, l_add_img_feats), dim=0
-                    )
-                    logger.debug(
-                        f"New train dim image: {layer_image_features_train.shape}"
-                    )
-                if len(l_add_txt_feats) > 1:
-                    layer_text_features_train = torch.cat(
-                        (layer_text_features_train, l_add_txt_feats), dim=0
-                    )
-                    logger.debug(
-                        f"New train dim text: {layer_text_features_train.shape}"
-                    )
+            if has_additional and n_random_additional_feats != 0:
+                # Load metadata for memmap shape info
+                if add_meta_path and Path(add_meta_path).exists():
+                    meta = torch.load(add_meta_path, weights_only=False)
+                    add_n = meta["total_n"]
+                    T_img_add = meta["T_img"]
+                    T_txt_add = meta["T_txt"]
+                    D_add = meta["D"]
+                else:
+                    meta = None
+
+                # Determine subsample indices
+                if n_random_additional_feats is not None:
+                    add_n_use = min(n_random_additional_feats, add_n if meta else n_random_additional_feats)
+                else:
+                    add_n_use = add_n if meta else None
+
+                # Load as memmap (.npy) or torch (.pt)
+                if str(add_img_path).endswith(".npy") and meta:
+                    import numpy as _np
+                    logger.debug(f"Loading LAION image features as memmap: {add_img_path}")
+                    img_mmap = _np.memmap(add_img_path, dtype=_np.float16, mode="r",
+                                          shape=(add_n, T_img_add, D_add))
+                    txt_mmap = _np.memmap(add_txt_path, dtype=_np.float16, mode="r",
+                                          shape=(add_n, T_txt_add, D_add))
+                    mask_mmap = None
+                    if add_txt_mask_path and Path(add_txt_mask_path).exists():
+                        mask_mmap = _np.memmap(add_txt_mask_path, dtype=_np.int64, mode="r",
+                                               shape=(add_n, T_txt_add))
+
+                    # Subsample indices
+                    if add_n_use and add_n_use < add_n:
+                        sub_idx = torch.randperm(add_n)[:add_n_use].sort().values.numpy()
+                        logger.debug(f"Subsampling LAION to {add_n_use}")
+                        wandb.run.tags = wandb.run.tags + (
+                            f"LAION subsample {add_n_use}",
+                        )
+                    else:
+                        sub_idx = None
+                        add_n_use = add_n
+
+                    # Pad COCO text to match LAION text length if needed
+                    T_coco = layer_text_features_train.shape[1] if layer_text_features_train.dim() == 3 else 0
+                    T_max = max(T_coco, T_txt_add) if T_coco > 0 else T_txt_add
+                    if T_coco > 0 and T_coco < T_max:
+                        layer_text_features_train = F.pad(
+                            layer_text_features_train, (0, 0, 0, T_max - T_coco)
+                        )
+                        if layer_text_mask_train is not None:
+                            layer_text_mask_train = F.pad(
+                                layer_text_mask_train, (0, T_max - T_coco)
+                            )
+
+                    # Estimate RAM needed for subsampled tokens
+                    est_bytes = add_n_use * (T_img_add + T_txt_add) * D_add * 2
+                    est_gb = est_bytes / 1e9
+                    RAM_THRESHOLD_GB = 170  # leave room for COCO + overhead
+
+                    if est_gb < RAM_THRESHOLD_GB:
+                        # Small enough to load into RAM — fast in-memory training
+                        # Load and concat one modality at a time to minimize
+                        # peak memory (free source before loading next).
+                        logger.debug(
+                            f"LAION subsample {add_n_use:,} fits in RAM "
+                            f"({est_gb:.0f} GB < {RAM_THRESHOLD_GB} GB). Loading into memory."
+                        )
+                        idx = sub_idx if sub_idx is not None else slice(None)
+
+                        # Image: load, concat, free source
+                        l_add_img = torch.from_numpy(_np.array(img_mmap[idx]))
+                        del img_mmap
+                        layer_image_features_train = torch.cat(
+                            (layer_image_features_train, l_add_img), dim=0
+                        )
+                        del l_add_img
+
+                        # Text: load, pad, concat, free source
+                        l_add_txt = torch.from_numpy(_np.array(txt_mmap[idx]))
+                        del txt_mmap
+                        if T_txt_add < T_max:
+                            l_add_txt = F.pad(
+                                l_add_txt, (0, 0, 0, T_max - T_txt_add)
+                            )
+                        layer_text_features_train = torch.cat(
+                            (layer_text_features_train, l_add_txt), dim=0
+                        )
+                        del l_add_txt
+
+                        # Mask: load, pad, concat, free source
+                        if mask_mmap is not None and layer_text_mask_train is not None:
+                            l_add_mask = torch.from_numpy(_np.array(mask_mmap[idx]))
+                            del mask_mmap
+                            if T_txt_add < T_max:
+                                l_add_mask = F.pad(
+                                    l_add_mask, (0, T_max - T_txt_add)
+                                )
+                            layer_text_mask_train = torch.cat(
+                                (layer_text_mask_train, l_add_mask), dim=0
+                            )
+                            del l_add_mask
+                        else:
+                            del mask_mmap
+
+                        import gc; gc.collect()
+                        logger.debug(
+                            f"In-memory concat: {layer_image_features_train.shape[0]:,} samples"
+                        )
+                    else:
+                        # Too large for RAM — use disk-backed ConcatFeatureStore
+                        from src.utils.memmap_features import ConcatFeatureStore
+                        layer_image_features_train = ConcatFeatureStore(
+                            layer_image_features_train, img_mmap, sub_idx, T_max=None
+                        )
+                        layer_text_features_train = ConcatFeatureStore(
+                            layer_text_features_train, txt_mmap, sub_idx,
+                            T_max=T_max if T_txt_add < T_max else None
+                        )
+                        if layer_text_mask_train is not None and mask_mmap is not None:
+                            layer_text_mask_train = ConcatFeatureStore(
+                                layer_text_mask_train, mask_mmap, sub_idx,
+                                T_max=T_max if T_txt_add < T_max else None
+                            )
+                        logger.debug(
+                            f"LAION memmap (disk-backed): {add_n_use:,} samples. "
+                            f"Combined train: {len(layer_image_features_train):,} samples"
+                        )
+                else:
+                    # Legacy: load as torch tensors into RAM
+                    l_add_img_feats = torch.load(add_img_path, weights_only=False)["image_feats"]
+                    l_add_txt_feats = torch.load(add_txt_path, weights_only=False)["text_feats"]
+                    l_add_txt_masks = None
+                    if add_txt_mask_path and Path(add_txt_mask_path).exists():
+                        l_add_txt_masks = torch.load(add_txt_mask_path, weights_only=False)["mask"]
+                    if add_n_use and add_n_use < l_add_img_feats.shape[0]:
+                        random_sequence = torch.randperm(l_add_img_feats.shape[0])[:add_n_use]
+                        l_add_img_feats = l_add_img_feats[random_sequence]
+                        l_add_txt_feats = l_add_txt_feats[random_sequence]
+                        if l_add_txt_masks is not None:
+                            l_add_txt_masks = l_add_txt_masks[random_sequence]
+                    if len(l_add_img_feats) > 0:
+                        layer_image_features_train = torch.cat(
+                            (layer_image_features_train, l_add_img_feats), dim=0
+                        )
+                    if len(l_add_txt_feats) > 0:
+                        T_coco = layer_text_features_train.shape[1] if layer_text_features_train.dim() == 3 else 0
+                        T_add = l_add_txt_feats.shape[1] if l_add_txt_feats.dim() == 3 else 0
+                        if T_coco > 0 and T_add > 0 and T_coco != T_add:
+                            T_max = max(T_coco, T_add)
+                            if T_coco < T_max:
+                                layer_text_features_train = F.pad(
+                                    layer_text_features_train, (0, 0, 0, T_max - T_coco)
+                                )
+                                if layer_text_mask_train is not None:
+                                    layer_text_mask_train = F.pad(
+                                        layer_text_mask_train, (0, T_max - T_coco)
+                                    )
+                            if T_add < T_max:
+                                l_add_txt_feats = F.pad(l_add_txt_feats, (0, 0, 0, T_max - T_add))
+                                if l_add_txt_masks is not None:
+                                    l_add_txt_masks = F.pad(l_add_txt_masks, (0, T_max - T_add))
+                        layer_text_features_train = torch.cat(
+                            (layer_text_features_train, l_add_txt_feats), dim=0
+                        )
+                        if layer_text_mask_train is not None and l_add_txt_masks is not None:
+                            layer_text_mask_train = torch.cat(
+                                (layer_text_mask_train, l_add_txt_masks), dim=0
+                            )
+                    logger.debug(f"New train dim image: {layer_image_features_train.shape}")
 
             log_dict = {
                 f"{layer_comb_str}/meta/layer_comb": layer_comb,
@@ -2061,17 +2213,24 @@ class AlignmentTrainer(Trainer):
 
         # randomly shuffle the embeddings since we didn't shuffle before
         random_sequence = torch.randperm(num_samples)
-        image_features = image_features[random_sequence]
-        text_features = text_features[random_sequence]
-        if text_mask is not None:
-            text_mask = text_mask[random_sequence]
-        if image_cls_attn is not None:
-            image_cls_attn = image_cls_attn[random_sequence]
+        _is_lazy = hasattr(image_features, '_b')  # ConcatFeatureStore
+        if not _is_lazy:
+            image_features = image_features[random_sequence]
+            text_features = text_features[random_sequence]
+            if text_mask is not None:
+                text_mask = text_mask[random_sequence]
+            if image_cls_attn is not None:
+                image_cls_attn = image_cls_attn[random_sequence]
 
         # NOTE: ablation from reviewers (fixed set for R_S)
         random_sequence_fixed = torch.randperm(num_samples)[: self.train_batch_size]
-        image_features_fixed = image_features[random_sequence_fixed]
-        text_features_fixed = text_features[random_sequence_fixed]
+        if _is_lazy:
+            _fixed_idx = random_sequence[random_sequence_fixed]
+            image_features_fixed = image_features[_fixed_idx]
+            text_features_fixed = text_features[_fixed_idx]
+        else:
+            image_features_fixed = image_features[random_sequence_fixed]
+            text_features_fixed = text_features[random_sequence_fixed]
 
         # in order to efficiently loop over the splits we use splits and modulo
         if additional_image_features is not None:
@@ -2102,8 +2261,13 @@ class AlignmentTrainer(Trainer):
             if end_i > num_samples and mixup_alpha > 0.0:
                 continue  # Skip last batch if it's not full, to simplify mixup
 
-            image_feats = image_features[i:end_i]
-            text_feats = text_features[i:end_i]
+            if _is_lazy:
+                batch_idx = random_sequence[i:end_i]
+                image_feats = image_features[batch_idx]
+                text_feats = text_features[batch_idx]
+            else:
+                image_feats = image_features[i:end_i]
+                text_feats = text_features[i:end_i]
             image_feats = image_feats.float().to(self.device)
             text_feats = text_feats.float().to(self.device)
 
@@ -2113,14 +2277,20 @@ class AlignmentTrainer(Trainer):
 
             if mixup_alpha > 0.0:
                 # To get a second batch, we can simply roll the original tensor
-                # This is an efficient way to pair each sample with a different one
                 roll_amount = self.train_batch_size // 2
-                image_feats2 = torch.roll(image_features, shifts=roll_amount, dims=0)[
-                    i:end_i
-                ]
-                text_feats2 = torch.roll(text_features, shifts=roll_amount, dims=0)[
-                    i:end_i
-                ]
+                if _is_lazy:
+                    rolled_batch_idx = random_sequence[
+                        (torch.arange(i, end_i) + roll_amount) % num_samples
+                    ]
+                    image_feats2 = image_features[rolled_batch_idx]
+                    text_feats2 = text_features[rolled_batch_idx]
+                else:
+                    image_feats2 = torch.roll(image_features, shifts=roll_amount, dims=0)[
+                        i:end_i
+                    ]
+                    text_feats2 = torch.roll(text_features, shifts=roll_amount, dims=0)[
+                        i:end_i
+                    ]
                 image_feats2 = image_feats2.float().to(self.device)
                 text_feats2 = text_feats2.float().to(self.device)
                 # Apply Mixup
@@ -2145,14 +2315,20 @@ class AlignmentTrainer(Trainer):
                 image_cls_attn is not None
                 and getattr(alignment_image, "cls_attn_prior", False)
             ):
-                img_cls_attn_batch = image_cls_attn[i:end_i].to(self.device)
+                if _is_lazy:
+                    img_cls_attn_batch = image_cls_attn[random_sequence[i:end_i]].to(self.device)
+                else:
+                    img_cls_attn_batch = image_cls_attn[i:end_i].to(self.device)
                 aligned_image_feats = alignment_image(
                     image_feats, cls_attn=img_cls_attn_batch
                 )
             else:
                 aligned_image_feats = alignment_image(image_feats)
             if text_mask is not None:
-                text_mask_batch = text_mask[i:end_i].to(self.device)
+                if _is_lazy:
+                    text_mask_batch = text_mask[random_sequence[i:end_i]].to(self.device)
+                else:
+                    text_mask_batch = text_mask[i:end_i].to(self.device)
                 aligned_text_feats = alignment_text(text_feats, mask=text_mask_batch)
             else:
                 aligned_text_feats = alignment_text(text_feats)
