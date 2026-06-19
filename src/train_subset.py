@@ -1,3 +1,12 @@
+"""Data-size sweep for representation alignment.
+
+Trains an alignment layer on random subsamples of the training set (seed 42)
+to trace the data-scaling curve. Subsample sizes are given via ``--samples``
+(default ``1000,5000,10000,50000``); pass a subset or a single value to run
+only those points — e.g. to resume an interrupted sweep with ``--samples
+10000,50000``. Full-data training is handled by the main training script, not
+here.
+"""
 import argparse
 from pathlib import Path
 
@@ -10,13 +19,19 @@ from src.train_alignment import load_dataset
 from src.trainers.alignment_trainer import AlignmentTrainer
 
 parser = argparse.ArgumentParser(
-    description="Experiments for the subsampled Representation Alignment.",
+    description="Data-size sweep for the subsampled Representation Alignment.",
 )
 parser.add_argument(
     "--config_path",
     type=str,
     required=True,
     help="Path to the config yaml.",
+)
+parser.add_argument(
+    "--samples",
+    type=str,
+    default="1000,5000,10000,50000",
+    help="Comma-separated subsample sizes to sweep (e.g. '10000,50000').",
 )
 parser.add_argument(
     "--wandb_notes",
@@ -75,10 +90,9 @@ if __name__ == "__main__":
     }
     trainer_kwargs = trainer_kwargs | config["alignment"]
 
-    step_size = 80_000
-    n_steps = 10
-    for n_samples in [step_size * x for x in range(5, n_steps + 1)]:
-        for seed in [1, 42, 55] if n_samples != 0 else [42]:
-            config["random_state"] = seed
-            trainer = AlignmentTrainer(**trainer_kwargs)
-            trainer.fit(n_random_additional_feats=n_samples)
+    sample_sizes = [int(s.strip()) for s in args.samples.split(",")]
+    for n_samples in sample_sizes:
+        config["random_state"] = 42
+        trainer = AlignmentTrainer(**trainer_kwargs)
+        trainer.fit(n_random_subsample_train=n_samples)
+        del trainer
